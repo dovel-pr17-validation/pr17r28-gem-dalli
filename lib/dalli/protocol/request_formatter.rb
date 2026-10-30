@@ -1,0 +1,363 @@
+# frozen_string_literal: true
+
+module Dalli
+  module Protocol
+    class Meta
+      ##
+      # Class that encapsulates logic for formatting meta protocol requests
+      # to memcached.
+      ##
+      module RequestFormatter
+        extend self
+
+        # Since these are string construction methods, we're going to disable these
+        # Rubocop directives.  We really can't make this construction much simpler,
+        # and introducing an intermediate object seems like overkill.
+        #
+        #
+        # Meta get flags:
+        #
+        # Thundering herd protection:
+        # - vivify_ttl (N flag): On miss, create a stub item and return W flag. The TTL
+        #   specifies how long the stub lives. Other clients see X (stale) and Z (lost race).
+        # - recache_ttl (R flag): If item's remaining TTL is below this threshold, return W
+        #   flag to indicate this client should recache. Other clients get Z (lost race).
+        #
+        # Metadata flags:
+        # - return_hit_status (h flag): Return whether item has been hit before (0 or 1)
+        # - return_last_access (l flag): Return seconds since item was last accessed
+        # - skip_lru_bump (u flag): Don't bump item in LRU, don't update hit status or last access
+        #
+        # Response flags (parsed by response processor):
+        # - W: Client won the right to recache this item
+        # - X: Item is stale (another client is regenerating)
+        # - Z: Client lost the recache race (another client is already regenerating)
+        # - h0/h1: Hit status (0 = first access, 1 = previously accessed)
+        # - l<N>: Seconds since last access
+        def meta_get(key:, value: true, return_cas: false, ttl: nil, quiet: false,
+                     vivify_ttl: nil, recache_ttl: nil,
+                     return_hit_status: false, return_last_access: false, return_ttl_remaining: false,
+                     skip_lru_bump: false, skip_flags: false, p_token: nil, l_token: nil)
+          cmd = "mg #{encoded_key(key)}"
+          # In raw mode (skip_flags: true), we don't request bitflags since they're not used.
+          # This saves 2 bytes per request and skips parsing on response.
+          cmd << (skip_flags ? ' v' : ' v f') if value
+          cmd << ' c' if return_cas
+          cmd << " T#{ttl_flag(:ttl, ttl)}" if ttl
+          cmd << routing_tokens(p_token: p_token, l_token: l_token)
+          cmd << ' k q s' if quiet # Return the key in the response if quiet
+          cmd << " N#{ttl_flag(:vivify_ttl, vivify_ttl)}" if vivify_ttl # Thundering herd: vivify on miss
+          # Thundering herd: win recache if TTL below threshold
+          cmd << " R#{integer_flag(:recache_ttl, recache_ttl)}" if recache_ttl
+          cmd << ' h' if return_hit_status # Return hit status (0 or 1)
+          cmd << ' l' if return_last_access # Return seconds since last access
+          cmd << ' t' if return_ttl_remaining # Return seconds of TTL remaining (-1 = no TTL)
+          cmd << ' u' if skip_lru_bump # Don't bump LRU or update access stats
+          cmd << TERMINATOR
+        end
+
+        # Fast path for the common single-key get with no optional flags.
+        # Produces the same bytes as meta_get(key: key, skip_flags: skip_flags)
+        # without the keyword-argument handling and incremental string building.
+        def plain_meta_get(key, skip_flags)
+          skip_flags ? "mg #{encoded_key(key)} v#{TERMINATOR}" : "mg #{encoded_key(key)} v f#{TERMINATOR}"
+        end
+
+        # Fast path for a plain set: mode :set, not quiet, no CAS and no routing
+        # tokens. Produces the same bytes as meta_set(key:, value:, bitflags:, ttl:)
+        # without the keyword-argument handling and incremental string building.
+        def plain_meta_set(key, value_bytesize, bitflags, ttl)
+          flags = bitflags ? " F#{bitflags}" : ''
+          flags += " T#{ttl_flag(:ttl, ttl)}" if ttl
+          if KeyRegularizer.required?(key)
+            "ms #{KeyRegularizer.encode(key)} #{value_bytesize} c b#{flags} MS#{TERMINATOR}"
+          else
+            "ms #{key} #{value_bytesize} c#{flags} MS#{TERMINATOR}"
+          end
+        end
+
+        # Pass terminate: false to leave off the trailing noop, for callers
+        # (the pipelined get) that send it separately.
+        def multi_meta_get(keys, skip_flags: false, return_cas: false, terminate: true, p_token: nil, l_token: nil)
+          # In raw mode: "mg <key> v k q s\r\n" (no f flag, key at index 2)
+          # Normal mode: "mg <key> v f k q s\r\n" (key at index 3)
+          # With return_cas a "c" flag follows, which shifts those indexes --
+          # callers of that variant locate tokens by flag rather than position.
+          # Routing tokens apply to every key in the batch, so the suffix is
+          # built once rather than per key.
+          post_get = if return_cas
+                       skip_flags ? ' v c' : ' v f c'
+                     else
+                       skip_flags ? ' v' : ' v f'
+                     end
+          post_get += routing_tokens(p_token: p_token, l_token: l_token)
+          post_get += " k q s#{TERMINATOR}"
+
+          buffer = ''.b
+          keys.each do |key|
+            buffer << 'mg ' << encoded_key(key) << post_get
+          end
+          terminate ? buffer << 'mn' << TERMINATOR : buffer
+        end
+
+        def meta_set(key:, value:, bitflags: nil, cas: nil, ttl: nil, mode: :set, quiet: false,
+                     p_token: nil, l_token: nil)
+          base64 = KeyRegularizer.required?(key)
+          key = KeyRegularizer.encode(key) if base64
+          cmd = "ms #{key} #{value.bytesize}"
+          # Skip the cas-return flag in quiet mode: the response is suppressed,
+          # so requesting it only adds bytes to the request.
+          cmd << ' c' if !quiet && !%i[append prepend].include?(mode)
+          cmd << ' b' if base64
+          cmd << " F#{bitflags}" if bitflags
+          cmd << cas_string(cas)
+          cmd << " T#{ttl_flag(:ttl, ttl)}" if ttl
+          cmd << " M#{mode_to_token(mode)}"
+          cmd << ' q' if quiet
+          cmd << routing_tokens(p_token: p_token, l_token: l_token)
+          cmd << TERMINATOR
+        end
+
+        def multi_meta_set(entries, ttl: nil, p_token: nil, l_token: nil)
+          # Routing tokens apply to every entry in the batch, so the suffix is
+          # built once rather than per entry.
+          token_suffix = routing_tokens(p_token: p_token, l_token: l_token)
+          ttl = ttl_flag(:ttl, ttl) if ttl
+
+          buffer = ''.b
+          entries.each do |key, pair|
+            value, bitflags = pair
+
+            base64 = KeyRegularizer.required?(key)
+            key = KeyRegularizer.encode(key) if base64
+
+            # Inline format: "ms <key> <size> c [b] F<flags> T<ttl> MS q [P/L]\r\n"
+            buffer << "ms #{key} #{value.bytesize} c"
+            buffer << ' b' if base64
+            buffer << " F#{bitflags}" if bitflags
+            buffer << " T#{ttl}" if ttl
+            buffer << ' MS q' << token_suffix << TERMINATOR << value << TERMINATOR
+          end
+          buffer << META_NOOP
+        end
+
+        # Thundering herd protection flag:
+        # - stale (I flag): Instead of deleting the item, mark it as stale. Other clients
+        #   using N/R flags will see the X flag and know the item is being regenerated.
+        # Tombstone flags:
+        # - stale (I flag): mark the item stale instead of removing it.  Readers
+        #   using N/R flags, or get_with_metadata, see the X flag and know the
+        #   item is being regenerated.
+        # - ttl (T flag): how long the stale marker lives.  memcached only honors
+        #   T on a delete when it is paired with I, so this raises rather than
+        #   emitting a request the server would apply differently than intended.
+        # - drop_value (x flag): remove the item's value but leave the item, so a
+        #   tombstone can be left without retaining the old payload.
+        def meta_delete(key:, cas: nil, ttl: nil, quiet: false, stale: false, drop_value: false,
+                        p_token: nil, l_token: nil)
+          # Message uses this method's own parameter names (ttl/stale), not the
+          # client-facing tombstone_ttl/invalidate names Dalli::Client validates
+          # against -- this guard is also reachable by internal callers (tests,
+          # direct RequestFormatter use) that never go through the client.
+          raise ArgumentError, 'ttl requires stale: true' if ttl && !stale
+
+          cmd = "md #{encoded_key(key)}"
+          cmd << cas_string(cas)
+          cmd << ' I' if stale # Mark stale instead of deleting
+          cmd << " T#{ttl_flag(:ttl, ttl)}" if ttl
+          cmd << ' x' if drop_value # Drop the value but keep the item
+          cmd << ' q' if quiet
+          cmd << routing_tokens(p_token: p_token, l_token: l_token)
+          cmd << TERMINATOR
+        end
+
+        # Same bytes as meta_delete(key: key), without the keyword-argument handling
+        def plain_meta_delete(key)
+          "md #{encoded_key(key)}#{TERMINATOR}"
+        end
+
+        # Tombstone and routing-token flags apply to every key in the batch;
+        # see meta_delete.
+        def multi_meta_delete(keys, stale: false, ttl: nil, drop_value: false, p_token: nil, l_token: nil)
+          raise ArgumentError, 'tombstone_ttl requires invalidate: true' if ttl && !stale
+
+          suffix = +''
+          suffix << ' I' if stale
+          suffix << " T#{ttl_flag(:ttl, ttl)}" if ttl
+          suffix << ' x' if drop_value
+          suffix << ' q'
+          suffix << routing_tokens(p_token: p_token, l_token: l_token)
+          suffix << TERMINATOR
+
+          buffer = ''.b
+          keys.each do |key|
+            buffer << 'md ' << encoded_key(key) << suffix
+          end
+          buffer << META_NOOP
+        end
+
+        def meta_arithmetic(key:, delta:, initial:, incr: true, cas: nil, ttl: nil, quiet: false,
+                            p_token: nil, l_token: nil)
+          cmd = "ma #{encoded_key(key)} v"
+          cmd << " D#{parse_to_64_bit_int(:delta, delta)}" if delta
+          cmd << " J#{parse_to_64_bit_int(:initial, initial)}" if initial
+          # Always set a TTL if an initial value is specified
+          cmd << " N#{ttl ? ttl_flag(:ttl, ttl) : 0}" if ttl || initial
+          cmd << cas_string(cas)
+          cmd << ' q' if quiet
+          cmd << " M#{incr ? 'I' : 'D'}"
+          cmd << routing_tokens(p_token: p_token, l_token: l_token)
+          cmd << TERMINATOR
+        end
+
+        # Builds the wire-format suffix for opaque routing tokens (P and L).
+        # memcached itself ignores these; they exist as hints for a proxy or
+        # router sitting between the client and memcached. See protocol.txt:
+        # "All commands accept tokens 'P' and 'L' which are completely ignored.
+        # The arguments to 'P' and 'L' can be used as hints or path
+        # specifications to a proxy or router inbetween a client and a
+        # memcached daemon."
+        #
+        # Empty / nil tokens are treated as no-ops. Whitespace and control
+        # characters are rejected with ArgumentError so a token can't be used
+        # for wire-protocol injection: CRLF would add a second command (e.g.
+        # "foo\r\nflush_all\r\n"), and a space would add meta flags to this one
+        # (e.g. "foo T1" changing an item's TTL on a read).
+        def routing_tokens(p_token: nil, l_token: nil)
+          # Only an empty *String* is a no-op. Checking respond_to?(:empty?)
+          # instead would also swallow p_token: [] / {} before the type check
+          # below ever runs, silently dropping caller mistakes that should
+          # raise "must be a String".
+          p_token = nil if p_token.is_a?(String) && p_token.empty?
+          l_token = nil if l_token.is_a?(String) && l_token.empty?
+          validate_routing_token!('p_token', p_token)
+          validate_routing_token!('l_token', l_token)
+          return '' unless p_token || l_token
+
+          s = +''
+          s << " P#{p_token}" if p_token
+          s << " L#{l_token}" if l_token
+          s
+        end
+        # rubocop:enable Metrics/CyclomaticComplexity
+        # rubocop:enable Metrics/ParameterLists
+        # rubocop:enable Metrics/PerceivedComplexity
+
+        META_NOOP = "mn#{TERMINATOR}".freeze
+        def meta_noop
+          META_NOOP
+        end
+
+        def version
+          "version#{TERMINATOR}"
+        end
+
+        def flush(delay: nil, quiet: false)
+          cmd = +'flush_all'
+          cmd << " #{parse_to_64_bit_int(:delay, delay)}" if delay
+          cmd << ' noreply' if quiet
+          cmd << TERMINATOR
+        end
+
+        ALLOWED_STATS_ARGS = [nil, '', 'items', 'slabs', 'settings', 'reset'].freeze
+
+        def stats(arg = nil)
+          raise ArgumentError, "Invalid stats argument: #{arg.inspect}" unless ALLOWED_STATS_ARGS.include?(arg)
+
+          cmd = +'stats'
+          cmd << " #{arg}" if arg && !arg.empty?
+          cmd << TERMINATOR
+        end
+
+        def encoded_key(key)
+          if KeyRegularizer.required?(key)
+            KeyRegularizer.encode(key) << ' b'
+          else
+            key
+          end
+        end
+
+        private
+
+        # Disallowed bytes: whitespace and control characters. CR, LF or NUL
+        # would let a token inject a second command; a space would let it add
+        # meta flags (T, N, I, q, ...) to the request it rides on.
+        ROUTING_TOKEN_FORBIDDEN = /[\x00-\x20\x7F]/
+        private_constant :ROUTING_TOKEN_FORBIDDEN
+
+        def validate_routing_token!(name, value)
+          return if value.nil?
+          raise ArgumentError, "#{name} must be a String, got #{value.class}" unless value.is_a?(String)
+          return unless value.match?(ROUTING_TOKEN_FORBIDDEN)
+
+          raise ArgumentError, "#{name} must not contain whitespace or control characters"
+        end
+
+        # Numeric flag values are written straight into the command line, so a
+        # value that isn't an integer -- e.g. a String carrying CRLF -- would let
+        # the caller inject further memcached commands. Converting to Integer
+        # means only digits ever reach the wire. Strings are parsed as base 10 so
+        # "010" means 10, as memcached would read it, rather than octal 8.
+        def integer_flag(name, value)
+          value.is_a?(String) ? Integer(value, 10) : Integer(value)
+        rescue ArgumentError, TypeError, FloatDomainError
+          raise ArgumentError, "#{name} must be an Integer, got #{value.inspect}"
+        end
+
+        # A TTL becomes memcached's expiration time, which must fit in a signed
+        # 32-bit value; anything else gets a CLIENT_ERROR reply, which a quiet
+        # request never reports. Callers pass TTLs through TtlSanitizer first.
+        def ttl_flag(name, value)
+          min = TtlSanitizer::MIN_EXPIRATION_TIME
+          max = TtlSanitizer::MAX_EXPIRATION_TIME
+          return value if value.is_a?(Integer) && value >= min && value <= max
+
+          ttl = integer_flag(name, value)
+          return ttl if ttl.between?(min, max)
+
+          raise ArgumentError, "#{name} must be between #{min} and #{max}, got #{value.inspect}"
+        end
+
+        def mode_to_token(mode)
+          case mode
+          when :add
+            'E'
+          when :replace
+            'R'
+          when :append
+            'A'
+          when :prepend
+            'P'
+          else
+            'S'
+          end
+        end
+
+        def cas_string(cas)
+          cas = parse_to_64_bit_int(:cas, cas)
+          cas.nil? || cas.zero? ? '' : " C#{cas}"
+        end
+
+        MAX_UINT64 = (2**64) - 1
+        private_constant :MAX_UINT64
+
+        # Parses a value memcached reads as an unsigned 64-bit integer (a CAS,
+        # an incr/decr delta or initial value, a flush delay): an Integer, or a
+        # String of decimal digits. Anything else raises. A bad CAS used to be
+        # dropped, which turned a CAS write into an unconditional one; a Float
+        # delta was truncated, so incr by 0.9 did nothing.
+        def parse_to_64_bit_int(name, val)
+          return nil if val.nil?
+
+          int = case val
+                when Integer then val
+                when String then Integer(val, 10, exception: false)
+                end
+          return int if int && int >= 0 && int <= MAX_UINT64
+
+          raise ArgumentError, "#{name} must be an Integer between 0 and #{MAX_UINT64}, got #{val.inspect}"
+        end
+      end
+    end
+  end
+end

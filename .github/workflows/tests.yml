@@ -1,0 +1,51 @@
+name: Tests
+
+# Pushes to other branches are covered by their pull request's run, so a PR
+# branch isn't tested twice
+on:
+  push:
+    branches: [main, '*-stable']
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby-version:
+          - head
+          - '4.0'
+          - '3.4'
+          - '3.3'
+          - jruby-10
+          - truffleruby
+        # Floor (Dalli::MIN_SUPPORTED_MEMCACHED_VERSION) and latest, so the
+        # supported-version claim in the README is actually exercised.
+        memcached-version: ['1.6.27', '1.6.45']
+
+    name: "Ruby ${{ matrix.ruby-version }} / Memcached ${{ matrix.memcached-version }}"
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Install Memcached ${{ matrix.memcached-version }}
+      working-directory: scripts
+      env:
+        MEMCACHED_VERSION: ${{ matrix.memcached-version }}
+      run: |
+        chmod +x ./install_memcached.sh
+        ./install_memcached.sh
+    - name: Set up Ruby ${{ matrix.ruby-version }}
+      uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+      with:
+        ruby-version: ${{ matrix.ruby-version }}
+        bundler-cache: true # 'bundle install' and cache
+    - name: Run tests
+      run: bundle exec rake

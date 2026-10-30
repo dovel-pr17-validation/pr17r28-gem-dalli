@@ -1,0 +1,692 @@
+# frozen_string_literal: true
+
+require_relative '../helper'
+
+describe 'Pipelined Get' do
+  MemcachedManager.supported_protocols.each do |p|
+    describe "using the #{p} protocol" do
+      it 'supports pipelined get' do
+        memcached_persistent(p) do |dc|
+          dc.close
+          dc.flush
+          resp = dc.get_multi(%w[a b c d e f])
+
+          assert_empty(resp)
+
+          dc.set('a', 'foo')
+          dc.set('b', 123)
+          dc.set('c', %w[a b c])
+
+          # Invocation without block
+          resp = dc.get_multi(%w[a b c d e f])
+          expected_resp = { 'a' => 'foo', 'b' => 123, 'c' => %w[a b c] }
+
+          assert_equal(expected_resp, resp)
+
+          # Invocation with block
+          dc.get_multi(%w[a b c d e f]) do |k, v|
+            assert(expected_resp.key?(k) && expected_resp[k] == v)
+            expected_resp.delete(k)
+          end
+
+          assert_empty expected_resp
+
+          # Perform a big quiet set with 1000 elements.
+          arr = []
+          dc.multi do
+            1000.times do |idx|
+              dc.set idx, idx
+              arr << idx
+            end
+          end
+
+          # Retrieve the elements with a pipelined get
+          result = dc.get_multi(arr)
+
+          assert_equal(1000, result.size)
+          assert_equal(50, result['50'])
+        end
+      end
+
+      it 'supports pipelined get with keys containing Unicode or spaces' do
+        memcached_persistent(p) do |dc|
+          dc.close
+          dc.flush
+
+          keys_to_query = ['a', 'b', 'contains space', 'ƒ©åÍÎ']
+
+          resp = dc.get_multi(keys_to_query)
+
+          assert_empty(resp)
+
+          dc.set('a', 'foo')
+          dc.set('contains space', 123)
+          dc.set('ƒ©åÍÎ', %w[a b c])
+
+          # Invocation without block
+          resp = dc.get_multi(keys_to_query)
+          expected_resp = { 'a' => 'foo', 'contains space' => 123, 'ƒ©åÍÎ' => %w[a b c] }
+
+          assert_equal(expected_resp, resp)
+
+          # Invocation with block
+          dc.get_multi(keys_to_query) do |k, v|
+            assert(expected_resp.key?(k) && expected_resp[k] == v)
+            expected_resp.delete(k)
+          end
+
+          assert_empty expected_resp
+        end
+      end
+
+      describe 'pipeline_next_responses' do
+        it 'raises NetworkError when called before pipeline_response_setup' do
+          memcached_persistent(p) do |dc|
+            server = dc.send(:ring).servers.first
+            server.request(:pipelined_get, %w[a b])
+            assert_raises Dalli::NetworkError do
+              server.pipeline_next_responses
+            end
+          end
+        end
+
+        it 'raises NetworkError when called after pipeline_abort' do
+          memcached_persistent(p) do |dc|
+            server = dc.send(:ring).servers.first
+            server.request(:pipelined_get, %w[a b])
+            server.pipeline_response_setup
+            server.pipeline_abort
+            assert_raises Dalli::NetworkError do
+              server.pipeline_next_responses
+            end
+          end
+        end
+      end
+
+      describe 'single-server get_multi fast path' do
+        it 'returns correct results via the fast path' do
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port)
+
+            dc.flush
+
+            dc.set('a', 'foo')
+            dc.set('b', 123)
+            dc.set('c', %w[a b c])
+
+            resp = dc.get_multi(%w[a b c d e f])
+            expected = { 'a' => 'foo', 'b' => 123, 'c' => %w[a b c] }
+
+            assert_equal(expected, resp)
+          end
+        end
+
+        it 'returns correct results with raw mode' do
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port, raw: true)
+
+            dc.flush
+
+            assert_raises(Dalli::MarshalError) { dc.set('n', 123) }
+
+            dc.set('x', 'hello')
+            dc.set('y', 'world')
+
+            resp = dc.get_multi(%w[x y z])
+
+            assert_equal({ 'x' => 'hello', 'y' => 'world' }, resp)
+          end
+        end
+
+        it 'returns correct results with namespace' do
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port, namespace: 'ns')
+
+            dc.flush
+
+            dc.set('a', 'val_a')
+            dc.set('b', 'val_b')
+
+            resp = dc.get_multi(%w[a b c])
+
+            assert_equal({ 'a' => 'val_a', 'b' => 'val_b' }, resp)
+            assert_equal 'val_a', single_server_client(port).get('ns:a')
+          end
+        end
+
+        it 'handles all misses' do
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port)
+
+            dc.flush
+
+            resp = dc.get_multi(%w[miss1 miss2 miss3])
+
+            assert_empty(resp)
+          end
+        end
+
+        it 'handles Unicode and space keys via fast path' do
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port)
+
+            dc.flush
+
+            dc.set('contains space', 'space_val')
+            dc.set('ƒ©åÍÎ', 'unicode_val')
+
+            resp = dc.get_multi(['contains space', 'ƒ©åÍÎ', 'missing'])
+
+            assert_equal({ 'contains space' => 'space_val', 'ƒ©åÍÎ' => 'unicode_val' }, resp)
+          end
+        end
+
+        it 'still uses block-based get_multi via PipelinedGetter' do
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port)
+
+            dc.flush
+
+            dc.set('a', 'foo')
+            dc.set('b', 'bar')
+
+            collected = {}
+            dc.get_multi(%w[a b c]) { |k, v| collected[k] = v }
+
+            assert_equal({ 'a' => 'foo', 'b' => 'bar' }, collected)
+          end
+        end
+
+        it 'retries on a transient (retryable) network error and returns the real result' do
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port)
+            dc.flush
+
+            dc.set('a', 'foo')
+
+            server = dc.send(:ring).servers.first
+            original_request = server.method(:request)
+            attempts = 0
+            flaky_request = lambda do |opkey, *args|
+              if opkey == :read_multi_req
+                attempts += 1
+                raise Dalli::RetryableNetworkError, 'transient blip' if attempts == 1
+              end
+
+              original_request.call(opkey, *args)
+            end
+
+            server.stub(:request, flaky_request) do
+              assert_equal({ 'a' => 'foo' }, dc.get_multi(%w[a]))
+            end
+
+            assert_equal 2, attempts
+          end
+        end
+
+        it 'raises Dalli::NetworkError on a terminal (non-retryable) network error' do
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port)
+            dc.flush
+
+            dc.set('a', 'foo')
+
+            server = dc.send(:ring).servers.first
+            failing_request = lambda do |opkey, *args|
+              raise Dalli::NetworkError, 'localhost is down' if opkey == :read_multi_req
+
+              raise "unexpected request: #{opkey}, #{args.inspect}"
+            end
+
+            server.stub(:request, failing_request) do
+              assert_raises(Dalli::NetworkError) { dc.get_multi(%w[a]) }
+            end
+          end
+        end
+      end
+
+      describe 'multi-server get_multi' do
+        def with_two_server_client(protocol, **options)
+          memcached_persistent(protocol, 21_345) do |_, port1|
+            memcached_persistent(protocol, 21_346) do |_, port2|
+              dc = Dalli::Client.new(["localhost:#{port1}", "localhost:#{port2}"], options)
+              begin
+                dc.flush
+                yield dc
+              ensure
+                dc.close
+              end
+            end
+          end
+        end
+
+        let(:keys) { Array.new(40) { |i| "key#{i}" } + ['key with spaces', 'clé'] }
+
+        # The block used to run inside the pipeline's socket-error rescue, so an
+        # Errno or Timeout::Error it raised was treated as a network failure:
+        # swallowed, with the whole get_multi retried and keys yielded twice.
+        it 'lets an exception raised by the block reach the caller, without retrying' do
+          with_two_server_client(p) do |dc|
+            keys = Array.new(20) { |i| "k#{i}" }
+            keys.each { |k| dc.set(k, "v-#{k}") }
+            yields = Hash.new(0)
+
+            assert_raises(Timeout::Error) do
+              dc.get_multi(keys) do |k, _|
+                yields[k] += 1
+                raise Timeout::Error, 'from the application' if yields.size == 3
+              end
+            end
+
+            assert_equal [1], yields.values.uniq
+            assert_equal 'v-k7', dc.get('k7')
+          end
+        end
+
+        it 'returns every value and keeps the connection aligned when a key is long once base64-encoded' do
+          with_two_server_client(p) do |dc|
+            many = Array.new(2000) { |i| "user:#{i}:token" }
+            many.each_slice(500) { |slice| dc.set_multi(slice.to_h { |k| [k, "token-for-#{k}"] }) }
+            dc.set('victim:email', 'victim@example.com')
+            # Under 250 characters, but over 250 bytes once base64-encoded
+            long_key = "search:#{'é' * 130}"
+            dc.set(long_key, 'search-result')
+
+            result = dc.get_multi_cas(long_key, *many)
+
+            assert_equal many.size + 1, result.size
+            assert_equal 'search-result', result[long_key]&.first
+            assert_equal 'victim@example.com', dc.get('victim:email')
+            assert_equal 'token-for-user:5:token', dc.get('user:5:token')
+          end
+        end
+
+        Minitest::Spec::MULTI_GETS.each do |name, multi_get|
+          it "#{name} returns one entry per key, under the caller's key, for long and repeated keys" do
+            with_two_server_client(p) do |dc|
+              long_key = 'x' * 300
+              expected = keys.to_h { |k| [k, "v-#{k}"] }.merge(long_key => 'long', "\xff".b => 'binary')
+              expected.each { |k, v| dc.set(k, v) }
+
+              assert_caller_keys expected, multi_get.call(dc, [long_key, *expected.keys, "\xff".b])
+            end
+          end
+        end
+
+        def with_pipeline_constant(name, value)
+          original = Dalli::PipelinedGetter.const_get(name)
+          Dalli::PipelinedGetter.send(:remove_const, name)
+          Dalli::PipelinedGetter.const_set(name, value)
+          yield
+        ensure
+          Dalli::PipelinedGetter.send(:remove_const, name)
+          Dalli::PipelinedGetter.const_set(name, original)
+        end
+
+        # Replies read while the requests are still being sent are kept apart
+        # until sending is done; they're returned under the caller's keys too
+        it "returns replies read while sending a large batch under the caller's keys" do
+          with_two_server_client(p, namespace: 'ns') do |dc|
+            expected = keys.to_h { |k| [k, "v-#{k}"] }.merge('x' * 300 => 'long', "caf\xe9".b => 'binary')
+            expected.each { |k, v| dc.set(k, v) }
+
+            with_pipeline_constant(:INTERLEAVE_THRESHOLD, 5) do
+              with_pipeline_constant(:CHUNK_SIZE, 5) do
+                assert_caller_keys expected, dc.get_multi(expected.keys)
+                assert_caller_keys expected, dc.get_multi_cas(expected.keys).transform_values(&:first)
+              end
+            end
+          end
+        end
+
+        it 'returns an empty value without cutting off the rest of its server' do
+          with_two_server_client(p, raw: true) do |dc|
+            big = 'x' * 20_000
+            many = Array.new(100) { |i| "key#{i}" }
+            many.each { |k| dc.set(k, big) }
+            dc.set('key5', '')
+            expected = many.to_h { |k| [k, k == 'key5' ? '' : big] }
+
+            assert_equal expected, dc.get_multi(many)
+
+            yielded = {}
+            dc.get_multi(many) { |k, v| yielded[k] = v }
+
+            assert_equal expected, yielded
+            # Nothing is left unread on either connection
+            many.each { |k| assert_equal expected[k], dc.get(k) }
+          end
+        end
+
+        it 'returns every value, in both hash and block form, across servers' do
+          with_two_server_client(p) do |dc|
+            keys.each { |k| dc.set(k, "v:#{k}") }
+            groups = dc.send(:ring).keys_grouped_by_server(keys.dup)
+
+            assert_equal 2, groups.size, 'keys should span both servers'
+
+            expected = keys.to_h { |k| [k, "v:#{k}"] }
+
+            assert_equal expected, dc.get_multi(keys + ['absent'])
+
+            yielded = {}
+            dc.get_multi(keys) { |k, v| yielded[k] = v }
+
+            assert_equal expected, yielded
+          end
+        end
+
+        it 'strips the namespace from returned keys' do
+          with_two_server_client(p, namespace: 'ns') do |dc|
+            keys.each { |k| dc.set(k, k) }
+
+            assert_equal keys.to_h { |k| [k, k] }, dc.get_multi(keys)
+          end
+        end
+
+        it 'still returns real CAS values from get_multi_cas' do
+          with_two_server_client(p) do |dc|
+            keys.each { |k| dc.set(k, k) }
+            result = dc.get_multi_cas(keys)
+
+            assert_equal keys.sort, result.keys.sort
+            keys.each do |k|
+              value, cas = result[k]
+
+              assert_equal k, value
+              assert_equal dc.get_cas(k).last, cas
+              assert_operator cas, :>, 0
+            end
+          end
+        end
+      end
+
+      # A get_multi can stop before reading all of its replies: the caller's
+      # block raises or breaks, or a Timeout.timeout fires. Neither those
+      # replies nor any already read into the response buffer may reach a
+      # later request.
+      describe 'after a get_multi that stopped early' do
+        # Above this many keys per server, a get_multi interleaves sending its
+        # requests with reading replies. Lowered so the test needs few keys.
+        def with_interleave_threshold(threshold)
+          original = Dalli::PipelinedGetter::INTERLEAVE_THRESHOLD
+          Dalli::PipelinedGetter.send(:remove_const, :INTERLEAVE_THRESHOLD)
+          Dalli::PipelinedGetter.const_set(:INTERLEAVE_THRESHOLD, threshold)
+          yield
+        ensure
+          Dalli::PipelinedGetter.send(:remove_const, :INTERLEAVE_THRESHOLD)
+          Dalli::PipelinedGetter.const_set(:INTERLEAVE_THRESHOLD, original)
+        end
+
+        # Larger than one socket read, so a stopped get_multi leaves replies
+        # both in the response buffer and on the socket
+        def big_value(key)
+          key * (200_000 / key.size)
+        end
+
+        def with_stopped_get_multi_client(protocol)
+          memcached_persistent(protocol) do |_, port|
+            dc = single_server_client(port, protocol: protocol, compress: false)
+            dc.flush
+            old_keys = Array.new(10) { |i| "old#{i}" }
+            old_keys.each { |k| dc.set(k, big_value(k)) }
+            new_keys = Array.new(20) { |i| "new#{i}" }
+            new_keys.each { |k| dc.set(k, "val-#{k}") }
+            with_interleave_threshold(10) { yield dc, port, old_keys, new_keys }
+          end
+        end
+
+        def assert_in_step(client, new_keys)
+          expected = new_keys.to_h { |k| [k, "val-#{k}"] }
+
+          # 20 keys, over the lowered threshold: the interleaved path
+          assert_equal expected, client.get_multi_cas(new_keys).transform_values(&:first)
+          yielded = {}
+          client.get_multi(new_keys) { |k, v| yielded[k] = v }
+
+          assert_equal expected, yielded
+          assert_nil client.get('missing')
+          assert_equal 'val-new3', client.get('new3')
+          assert_equal big_value('old1'), client.get('old1')
+        end
+
+        def assert_pipeline_closed(client)
+          server = client.send(:ring).servers.first
+
+          refute_predicate server.instance_variable_get(:@connection_manager), :request_in_progress?
+          refute_predicate server.send(:response_buffer), :in_progress?
+        end
+
+        it 'stays in step when the block raises' do
+          with_stopped_get_multi_client(p) do |dc, _, old_keys, new_keys|
+            assert_raises(RuntimeError) { dc.get_multi(old_keys) { raise 'stop' } }
+
+            assert_pipeline_closed(dc)
+            assert_in_step(dc, new_keys)
+          end
+        end
+
+        it 'stays in step when the block raises from get_multi_cas' do
+          with_stopped_get_multi_client(p) do |dc, _, old_keys, new_keys|
+            assert_raises(RuntimeError) { dc.get_multi_cas(old_keys) { raise 'stop' } }
+
+            assert_in_step(dc, new_keys)
+          end
+        end
+
+        it 'stays in step when the block breaks' do
+          with_stopped_get_multi_client(p) do |dc, _, old_keys, new_keys|
+            first = nil
+            dc.get_multi(old_keys) do |k, _|
+              first = k
+              break
+            end
+
+            assert_equal 'old0', first
+            assert_pipeline_closed(dc)
+            assert_in_step(dc, new_keys)
+          end
+        end
+
+        it 'stays in step when a Timeout.timeout fires during the get_multi' do
+          with_stopped_get_multi_client(p) do |dc, _, old_keys, new_keys|
+            assert_raises(Timeout::Error) do
+              Timeout.timeout(0.1) { dc.get_multi(old_keys) { sleep 5 } }
+            end
+
+            assert_pipeline_closed(dc)
+            assert_in_step(dc, new_keys)
+          end
+        end
+
+        it 'stays in step when a value cannot be deserialized' do
+          with_stopped_get_multi_client(p) do |dc, port, old_keys, new_keys|
+            # Flagged as serialized (bitflag 1), but not a Marshal dump
+            TCPSocket.open('127.0.0.1', port) do |sock|
+              sock.write("set bad 1 0 7\r\ngarbage\r\n")
+
+              assert_equal "STORED\r\n", sock.gets
+            end
+            keys = old_keys.dup.insert(3, 'bad')
+
+            assert_raises(Dalli::UnmarshalError) { dc.get_multi(keys) { |_k, _v| nil } }
+            assert_pipeline_closed(dc)
+            assert_in_step(dc, new_keys)
+          end
+        end
+
+        it 'raises and stays in step when the block makes a request to the same server' do
+          with_stopped_get_multi_client(p) do |dc, _, old_keys, new_keys|
+            assert_raises(Dalli::DalliError) do
+              dc.get_multi(old_keys) { |k, _| dc.set("copy-#{k}", 'x') }
+            end
+
+            assert_equal 'x', dc.get('copy-old0')
+            assert_pipeline_closed(dc)
+            assert_in_step(dc, new_keys)
+          end
+        end
+
+        it 'keeps the connection open when the get_multi completes' do
+          with_stopped_get_multi_client(p) do |dc, _, old_keys, new_keys|
+            dc.get('new1')
+            conn = dc.send(:ring).servers.first.instance_variable_get(:@connection_manager)
+            sock = conn.sock
+            yielded = 0
+            dc.get_multi(old_keys + new_keys) { yielded += 1 }
+
+            assert_equal old_keys.size + new_keys.size, yielded
+            assert_same sock, conn.sock
+          end
+        end
+      end
+
+      # Like get, a multi-get raises Dalli::UnmarshalError for a value that
+      # can't be deserialized, but only once the rest of the replies are read:
+      # the connection stays open and in step.
+      describe 'when a value cannot be deserialized' do
+        let(:good_keys) { Array.new(20) { |i| "good#{i}" } }
+        let(:expected) { good_keys.to_h { |k| [k, "val-#{k}"] } }
+        let(:keys) { good_keys.dup.insert(7, 'bad') }
+
+        def socks(client)
+          client.send(:ring).servers.map { |s| s.instance_variable_get(:@connection_manager).sock }
+        end
+
+        # The bad value is stored on every server, so it's found whichever
+        # one the key maps to
+        def with_bad_value_client(protocol, server_count)
+          memcached_persistent(protocol, 21_345) do |_, port1|
+            memcached_persistent(protocol, 21_346) do |_, port2|
+              ports = [port1, port2].first(server_count)
+              dc = Dalli::Client.new(ports.map { |port| "localhost:#{port}" }, compress: false)
+              dc.flush
+              good_keys.each { |k| dc.set(k, "val-#{k}") }
+              ports.each { |port| store_undeserializable(port, 'bad') }
+              yield dc
+            end
+          end
+        end
+
+        def assert_in_step(client, socks_before)
+          assert_equal socks_before, socks(client), 'the connections should stay open'
+          assert_equal expected, client.get_multi(good_keys)
+          yielded = {}
+          client.get_multi(good_keys) { |k, v| yielded[k] = v }
+
+          assert_equal expected, yielded
+          assert_equal expected, client.get_multi_cas(good_keys).transform_values(&:first)
+          assert_equal 'val-good3', client.get('good3')
+        end
+
+        def with_pipeline_constants(**values)
+          originals = values.to_h { |name, _| [name, Dalli::PipelinedGetter.const_get(name)] }
+          values.each do |name, value|
+            Dalli::PipelinedGetter.send(:remove_const, name)
+            Dalli::PipelinedGetter.const_set(name, value)
+          end
+          yield
+        ensure
+          originals.each do |name, value|
+            Dalli::PipelinedGetter.send(:remove_const, name)
+            Dalli::PipelinedGetter.const_set(name, value)
+          end
+        end
+
+        (1..2).each do |server_count|
+          describe "with #{server_count} server(s)" do
+            it 'raises from get_multi' do
+              with_bad_value_client(p, server_count) do |dc|
+                before = socks(dc)
+
+                assert_raises(Dalli::UnmarshalError) { dc.get_multi(keys) }
+                assert_in_step(dc, before)
+              end
+            end
+
+            it 'raises from get_multi with a block, after yielding the other values' do
+              with_bad_value_client(p, server_count) do |dc|
+                before = socks(dc)
+                yielded = {}
+
+                assert_raises(Dalli::UnmarshalError) { dc.get_multi(keys) { |k, v| yielded[k] = v } }
+                assert_equal expected, yielded
+                assert_in_step(dc, before)
+              end
+            end
+
+            it 'raises from get_multi_cas' do
+              with_bad_value_client(p, server_count) do |dc|
+                before = socks(dc)
+
+                assert_raises(Dalli::UnmarshalError) { dc.get_multi_cas(keys) }
+                assert_raises(Dalli::UnmarshalError) { dc.get_multi_cas(keys) { |_k, _data| nil } }
+                assert_in_step(dc, before)
+              end
+            end
+
+            # A large get_multi parses the replies that arrive while it is
+            # still sending its requests. An error there used to be taken for
+            # the server failing, and that server's keys dropped.
+            it 'raises when the value is read while the requests are being sent' do
+              with_bad_value_client(p, server_count) do |dc|
+                dc.send(:ring).servers.each do |server|
+                  # Waits for replies, so the bad one is read during sending
+                  server.singleton_class.prepend(Module.new do
+                    private def drain_pipeline_responses(results)
+                      sock.wait_readable(1)
+                      super
+                    end
+                  end)
+                end
+                before = socks(dc)
+
+                with_pipeline_constants(INTERLEAVE_THRESHOLD: 3, CHUNK_SIZE: 3) do
+                  assert_raises(Dalli::UnmarshalError) { dc.get_multi(['bad', *good_keys]) }
+                  assert_in_step(dc, before)
+                end
+              end
+            end
+          end
+        end
+      end
+
+      describe 'pipelined_get_interleaved' do
+        it 'works with chunked requests' do
+          memcached_persistent(p) do |dc|
+            dc.flush
+
+            # Set some keys
+            10.times { |i| dc.set("key#{i}", "value#{i}") }
+
+            # Use get_multi with a lower interleave threshold to test the interleaved path
+            # We'll temporarily modify the threshold constant
+            original_threshold = Dalli::PipelinedGetter::INTERLEAVE_THRESHOLD
+            original_chunk = Dalli::PipelinedGetter::CHUNK_SIZE
+            begin
+              Dalli::PipelinedGetter.send(:remove_const, :INTERLEAVE_THRESHOLD)
+              Dalli::PipelinedGetter.send(:remove_const, :CHUNK_SIZE)
+              Dalli::PipelinedGetter.const_set(:INTERLEAVE_THRESHOLD, 3)
+              Dalli::PipelinedGetter.const_set(:CHUNK_SIZE, 3)
+
+              # Now get_multi should use interleaved mode for 10 keys
+              keys = Array.new(10) { |i| "key#{i}" }
+              result = dc.get_multi(keys)
+
+              # Verify we got all keys back
+              assert_equal 10, result.size
+              10.times do |i|
+                assert_equal "value#{i}", result["key#{i}"]
+              end
+            ensure
+              Dalli::PipelinedGetter.send(:remove_const, :INTERLEAVE_THRESHOLD)
+              Dalli::PipelinedGetter.send(:remove_const, :CHUNK_SIZE)
+              Dalli::PipelinedGetter.const_set(:INTERLEAVE_THRESHOLD, original_threshold)
+              Dalli::PipelinedGetter.const_set(:CHUNK_SIZE, original_chunk)
+            end
+          end
+        end
+      end
+    end
+  end
+end

@@ -1,0 +1,505 @@
+# frozen_string_literal: true
+
+module Dalli
+  module Protocol
+    class Meta
+      ##
+      # Class that encapsulates logic for processing meta protocol responses
+      # from memcached.  Includes logic for pulling data from an IO source
+      # and parsing into local values.  Handles errors on unexpected values.
+      ##
+      class ResponseProcessor
+        EN = 'EN'
+        END_TOKEN = 'END'
+        EX = 'EX'
+        HD = 'HD'
+        MN = 'MN'
+        NF = 'NF'
+        NS = 'NS'
+        OK = 'OK'
+        RESET = 'RESET'
+        STAT = 'STAT'
+        VA = 'VA'
+        VERSION = 'VERSION'
+        SERVER_ERROR = 'SERVER_ERROR'
+
+        VA_PREFIX = 'VA '
+        # memcached can't store an item larger than 1 GiB (its -I maximum)
+        MAX_VALUE_BYTES = 1024 * 1024 * 1024
+        HD_PREFIX = 'HD '
+        FLAGS_TOKEN_PREFIX = ' f'
+        CAS_TOKEN_PREFIX = ' c'
+        KEY_TOKEN_PREFIX = ' k'
+        BYTE_B = 'b'.ord
+        BYTE_C = 'c'.ord
+        BYTE_F = 'f'.ord
+        BYTE_K = 'k'.ord
+        BYTE_S = 's'.ord
+
+        T_OK = [OK].freeze
+        T_RESET = [RESET].freeze
+        T_EN_HD = [EN, HD].freeze
+        T_VERSION = [VERSION].freeze
+        T_VA_EN_HD = [VA, EN, HD].freeze
+        T_HD_NF_EX = [HD, NF, EX].freeze
+        T_HD_NS_NF_EX = [HD, NS, NF, EX].freeze
+        T_VA_NF_NS_EX = [VA, NF, NS, EX].freeze
+        T_END_TOKEN_STAT = [END_TOKEN, STAT].freeze
+
+        def initialize(io_source, value_marshaller)
+          @io_source = io_source
+          @value_marshaller = value_marshaller
+        end
+
+        # raw: true (a request made with raw: true) returns the value as stored,
+        # ignoring any flags in the reply. The request didn't ask for flags, so
+        # a reply carrying them anyway must not get the value deserialized.
+        def meta_get_with_value(cache_nils: false, raw: false)
+          line = read_line
+          # A hit ("VA <size> f<flags>") is parsed in place rather than split
+          # into tokens, which saves several allocations on the hottest path.
+          if line&.start_with?(VA_PREFIX)
+            return retrieve(read_data(size_from_va_line(line)), raw ? 0 : bitflags_from_va_line(line), raw)
+          end
+
+          tokens = line&.split || []
+          case tokens.first
+          when EN
+            cache_nils ? ::Dalli::NOT_FOUND : nil
+          when VA # only reached for an unusually formatted hit line
+            retrieve(read_data(tokens[1].to_i), raw ? 0 : bitflags_from_tokens(tokens), raw)
+          when HD
+            true
+          else
+            raise_unexpected!(tokens)
+          end
+        end
+
+        def meta_get_with_value_and_cas(raw: false)
+          tokens = error_on_unexpected!(T_VA_EN_HD)
+          return [nil, 0] if tokens.first == EN
+
+          cas = cas_from_tokens(tokens)
+          return [nil, cas] unless tokens.first == VA
+
+          [retrieve(read_data(tokens[1].to_i), raw ? 0 : bitflags_from_tokens(tokens), raw), cas]
+        end
+
+        def meta_get_without_value
+          tokens = error_on_unexpected!(T_EN_HD)
+          tokens.first == EN ? nil : true
+        end
+
+        # Returns a hash with all requested metadata:
+        # - :value - the cached value (or nil if miss)
+        # - :cas - the CAS value (if return_cas was requested)
+        # - :won_recache - true if client won the right to recache (W flag)
+        # - :stale - true if the item is stale (X flag)
+        # - :lost_recache - true if another client is already recaching (Z flag)
+        # - :hit_before - true/false if item was previously accessed (h flag, if requested)
+        # - :last_access - seconds since last access (l flag, if requested)
+        #
+        # Used by meta_get for comprehensive metadata retrieval.
+        # Supports thundering herd protection (N/R flags) and metadata flags (h/l/u).
+        def meta_get_with_metadata(cache_nils: false, return_hit_status: false, return_last_access: false,
+                                   return_ttl_remaining: false, raw: false)
+          tokens = error_on_unexpected!(T_VA_EN_HD)
+          result = build_metadata_result(tokens)
+          result[:hit_before] = hit_status_from_tokens(tokens) if return_hit_status
+          result[:last_access] = last_access_from_tokens(tokens) if return_last_access
+          result[:ttl_remaining] = ttl_remaining_from_tokens(tokens) if return_ttl_remaining
+          result[:value] = parse_value_from_tokens(tokens, cache_nils, raw)
+          result
+        end
+
+        def build_metadata_result(tokens)
+          {
+            value: nil, cas: cas_from_tokens(tokens),
+            won_recache: tokens.include?('W'), stale: tokens.include?('X'),
+            lost_recache: tokens.include?('Z'),
+            # Explicit miss marker: EN means the key does not exist.  A tombstoned
+            # item is NOT a miss -- it answers VA/HD with the X flag set -- and a
+            # stored nil under cache_nils is not one either, so neither can be
+            # inferred from value or cas alone.
+            miss: tokens.first == EN
+          }
+        end
+
+        def parse_value_from_tokens(tokens, cache_nils, raw = false) # rubocop:disable Style/OptionalBooleanParameter
+          return cache_nils ? ::Dalli::NOT_FOUND : nil if tokens.first == EN
+          return unless tokens.first == VA
+
+          retrieve(read_data(tokens[1].to_i), raw ? 0 : bitflags_from_tokens(tokens), raw)
+        end
+
+        def meta_set_with_cas
+          line = read_line
+          # A stored item ("HD c<cas>") is parsed in place rather than split into tokens
+          # Search from just after "HD": the " c" token starts at the space that follows it
+          return flag_from_line(line, CAS_TOKEN_PREFIX, HD.bytesize) if line&.start_with?(HD_PREFIX)
+
+          tokens = line&.split || []
+          raise_unexpected!(tokens) unless T_HD_NS_NF_EX.include?(tokens.first)
+          return false unless tokens.first == HD
+
+          cas_from_tokens(tokens)
+        end
+
+        def meta_set_append_prepend
+          tokens = error_on_unexpected!(T_HD_NS_NF_EX)
+          return false unless tokens.first == HD
+
+          true
+        end
+
+        def meta_delete
+          line = read_line
+          # The two common replies, compared as whole lines instead of split into tokens
+          return true if line == HD
+          return false if line == NF
+
+          tokens = line&.split || []
+          raise_unexpected!(tokens) unless T_HD_NF_EX.include?(tokens.first)
+          tokens.first == HD
+        end
+
+        def decr_incr
+          tokens = error_on_unexpected!(T_VA_NF_NS_EX)
+          return false if [NS, EX].include?(tokens.first)
+          return nil if tokens.first == NF
+
+          read_line.to_i
+        end
+
+        def stats
+          tokens = error_on_unexpected!(T_END_TOKEN_STAT)
+          values = {}
+          while tokens.first != END_TOKEN
+            values[tokens[1]] = tokens[2]
+            tokens = next_line_to_tokens
+          end
+          values
+        end
+
+        def flush
+          error_on_unexpected!(T_OK)
+
+          true
+        end
+
+        def reset
+          error_on_unexpected!(T_RESET)
+
+          true
+        end
+
+        def version
+          tokens = error_on_unexpected!(T_VERSION)
+          tokens.last
+        end
+
+        def consume_all_responses_until_mn
+          tokens = next_line_to_tokens
+
+          tokens = next_line_to_tokens while tokens.first != MN
+          true
+        end
+
+        # Consumes the responses to a batch of quiet (pipelined) delete
+        # requests, which are terminated by a noop (MN). In quiet mode
+        # memcached suppresses the success response for each deleted key, so
+        # every line received before the terminator corresponds to a key that
+        # was NOT deleted -- a miss (NF) or an error. Returns that count so
+        # callers can derive the number of successful deletes as
+        # (keys_sent - non_deletions).
+        def pipelined_delete_non_deletions
+          non_deletions = 0
+          tokens = next_line_to_tokens
+          until tokens.first == MN
+            non_deletions += 1
+            tokens = next_line_to_tokens
+          end
+          non_deletions
+        end
+
+        ##
+        # This method returns an array of values used in a pipelined
+        # getk process.  The first value is the number of bytes by
+        # which to advance the pointer in the buffer.  If the
+        # complete response is found in the buffer, this will
+        # be the response size.  Otherwise it is zero.
+        #
+        # The remaining three values in the array are the ResponseHeader,
+        # key, and value.
+        ##
+        # raw: true returns values as stored, ignoring flags in the replies;
+        # see meta_get_with_value.
+        def getk_response_from_buffer(buf, offset = 0, raw: false)
+          # Find the header terminator starting from offset
+          term_idx = buf.byteindex(TERMINATOR, offset)
+          return [0] unless term_idx
+
+          if buf.byteslice(offset, VA_PREFIX.bytesize) == VA_PREFIX
+            response = va_response_from_buffer(buf, offset, term_idx, raw)
+            return response if response
+          end
+
+          header = buf.byteslice(offset, term_idx - offset)
+          tokens = header.split
+          header_len = header.bytesize + TERMINATOR.length
+
+          # Read the s, f, c and k flags and the b marker in one pass. As with
+          # value_from_tokens, the first token for each flag wins.
+          size = bitflags = cas = key = nil
+          base64 = false
+          tokens.each do |token|
+            case token.getbyte(0)
+            when BYTE_S then size ||= token
+            when BYTE_F then bitflags ||= token
+            when BYTE_C then cas ||= token
+            when BYTE_K then key ||= token
+            when BYTE_B then base64 ||= token == 'b'
+            end
+          end
+          # memcached also gives the size positionally ("VA <size> ..."); use it
+          # when there's no s flag rather than reading the value as replies
+          body_len = size ? flag_int(size, 's') : positional_size(tokens)
+
+          # A complete response with no body. Only the terminating noop's MN
+          # ends the pipeline. Any other bodyless reply (CLIENT_ERROR,
+          # SERVER_ERROR, ...) answers one key's request: report it with a
+          # false status so the caller skips it and keeps reading. Treating it
+          # as the end would leave the remaining replies on the connection for
+          # later commands to read as their own. A hit on an empty value (VA 0)
+          # still has a body -- just its terminator -- so it's parsed below.
+          return [tokens.first == MN, header_len] if body_len.zero? && tokens.first != VA
+
+          check_value_size!(body_len)
+          resp_size = header_len + body_len + TERMINATOR.length
+          # The header is in the buffer, but the body is not.  As we don't have
+          # a complete response, don't advance the buffer
+          return [0] unless buf.bytesize >= offset + resp_size
+
+          # A hit with no key can't be matched to a request: skip it (false
+          # status) rather than yield it, or take it for the end of the pipeline
+          return [false, resp_size] unless key
+
+          key = key.delete_prefix!('k')
+          key = KeyRegularizer.decode(key) if base64
+          # The full response is in our buffer, so parse it and return
+          # the values
+          begin
+            value = retrieve(buf.byteslice(offset + header_len, body_len), raw ? 0 : flag_int(bitflags, 'f'), raw)
+          rescue Dalli::UnmarshalError => e
+            return unmarshal_failed(e, key, resp_size)
+          end
+          [tokens.first == VA, flag_int(cas, 'c'), key, value, resp_size]
+        end
+
+        # getk_response_from_buffer for a "VA ..." header, read in place
+        # without allocating the header, its tokens or the flag strings.
+        # Gives the same result as the token path. Returns nil to fall back to
+        # it when the header has no s flag or a zero size.
+        def va_response_from_buffer(buf, offset, term_idx, raw = false) # rubocop:disable Style/OptionalBooleanParameter
+          size = bitflags = cas = key = nil
+          base64 = false
+          pos = buf.byteindex(' ', offset + VA_PREFIX.bytesize)
+          while pos && pos < term_idx
+            start = pos + 1
+            pos = buf.byteindex(' ', start)
+            stop = pos && pos < term_idx ? pos : term_idx
+            case buf.getbyte(start)
+            when BYTE_S then size ||= flag_int_at(buf, start, stop)
+            when BYTE_F then bitflags ||= flag_int_at(buf, start, stop)
+            when BYTE_C then cas ||= flag_int_at(buf, start, stop)
+            when BYTE_K then key ||= buf.byteslice(start + 1, stop - start - 1)
+            when BYTE_B then base64 ||= stop == start + 1
+            end
+          end
+          return nil if size.nil? || size.zero?
+
+          check_value_size!(size)
+          header_len = term_idx - offset + TERMINATOR.length
+          resp_size = header_len + size + TERMINATOR.length
+          return [0] unless buf.bytesize >= offset + resp_size
+
+          # Skipped like the token path does; see getk_response_from_buffer
+          return [false, resp_size] unless key
+
+          key = KeyRegularizer.decode(key) if base64
+          begin
+            value = retrieve(buf.byteslice(offset + header_len, size), raw ? 0 : bitflags || 0, raw)
+          rescue Dalli::UnmarshalError => e
+            return unmarshal_failed(e, key, resp_size)
+          end
+          [true, cas || 0, key, value, resp_size]
+        end
+
+        # A pipelined reply whose value can't be deserialized is consumed and
+        # skipped (false status), so the replies after it stay in step. Its
+        # key is still returned for the reply key check. The first such error
+        # is held until the pipeline finishes; see take_unmarshal_error.
+        def unmarshal_failed(error, key, resp_size)
+          @unmarshal_error ||= error
+          [false, 0, key, nil, resp_size]
+        end
+
+        # Returns the error held by unmarshal_failed, if any, and forgets it
+        def take_unmarshal_error
+          error = @unmarshal_error
+          @unmarshal_error = nil
+          error
+        end
+
+        # Values from a raw request are returned as stored
+        def retrieve(value, bitflags, raw)
+          raw ? value : @value_marshaller.retrieve(value, bitflags)
+        end
+
+        # Integer value of a flag's token in buf, after its one-byte prefix,
+        # as flag_int would read it
+        def flag_int_at(buf, start, stop)
+          buf.byteslice(start + 1, stop - start - 1).to_i
+        end
+
+        # Integer value of a flag token such as "f123", or 0 when absent.
+        # Strips the prefix in place, like value_from_tokens.
+        def flag_int(token, flag)
+          token ? token.delete_prefix!(flag).to_i : 0
+        end
+
+        def error_on_unexpected!(expected_codes)
+          tokens = next_line_to_tokens
+
+          return tokens if expected_codes.include?(tokens.first)
+
+          raise_unexpected!(tokens)
+        end
+
+        def raise_unexpected!(tokens)
+          raise Dalli::ServerError, tokens.join(' ').to_s if tokens.first == SERVER_ERROR
+
+          raise Dalli::DalliError, "Response error: #{tokens.first}"
+        end
+
+        def bitflags_from_tokens(tokens)
+          value_from_tokens(tokens, 'f').to_i
+        end
+
+        # String#to_i stops at the first non-digit, so these read one token's
+        # integer straight out of the header line without splitting it.
+        def size_from_va_line(line)
+          line.byteslice(VA_PREFIX.bytesize, line.bytesize).to_i
+        end
+
+        def bitflags_from_va_line(line)
+          flag_from_line(line, FLAGS_TOKEN_PREFIX, VA_PREFIX.bytesize)
+        end
+
+        # The key from a VA line's k flag, decoded when the line has the b flag,
+        # or nil when there is no k flag
+        def key_from_va_line(line)
+          idx = line.index(KEY_TOKEN_PREFIX, VA_PREFIX.bytesize)
+          return unless idx
+
+          start = idx + KEY_TOKEN_PREFIX.bytesize
+          stop = line.index(' ', start) || line.index(TERMINATOR, start) || line.bytesize
+          key = line.byteslice(start, stop - start)
+          base64_flag_in_line?(line) ? KeyRegularizer.decode(key) : key
+        end
+
+        def base64_flag_in_line?(line)
+          line.include?(' b ') || line.end_with?(" b#{TERMINATOR}", ' b')
+        end
+
+        # Integer value of the first " <flag><digits>" token at or after start, or 0
+        def flag_from_line(line, token_prefix, start)
+          idx = line.index(token_prefix, start)
+          idx ? line.byteslice(idx + token_prefix.bytesize, line.bytesize).to_i : 0
+        end
+
+        def cas_from_tokens(tokens)
+          value_from_tokens(tokens, 'c').to_i
+        end
+
+        # Detects the X presence flag, set when an item has been marked stale by a
+        # prior `md key I`.  Uses strict equality (Array#any? with a String pattern
+        # compares with ==) so a future value-bearing flag beginning with X cannot
+        # be mistaken for it.
+        def stale_from_tokens(tokens)
+          tokens.any?('X')
+        end
+
+        def key_from_tokens(tokens)
+          encoded_key = value_from_tokens(tokens, 'k')
+          if tokens.delete('b')
+            KeyRegularizer.decode(encoded_key)
+          else
+            encoded_key
+          end
+        end
+
+        # Returns true if item was previously hit, false if first access, nil if not requested
+        # The h flag returns h0 (first access) or h1 (previously accessed)
+        def hit_status_from_tokens(tokens)
+          hit_token = tokens.find { |t| t.start_with?('h') && t.length == 2 }
+          return nil unless hit_token
+
+          hit_token[1] == '1'
+        end
+
+        # Returns seconds since last access, or nil if not requested
+        # The l flag returns l<seconds>
+        def last_access_from_tokens(tokens)
+          value_from_tokens(tokens, 'l').to_i
+        end
+
+        # Returns seconds of TTL remaining; -1 when the item has no expiry.
+        # The t flag returns t<seconds>.
+        def ttl_remaining_from_tokens(tokens)
+          value_from_tokens(tokens, 't').to_i
+        end
+
+        def value_from_tokens(tokens, flag)
+          # NB: as an optimization, we're mutating the matching token in place
+          # so there is a baked assumption that we're only accessing each token at most once.
+          index = tokens.find_index { |t| t.start_with?(flag) }
+          if index
+            tokens.delete_at(index).delete_prefix!(flag)
+          else
+            0
+          end
+        end
+
+        # A pipelined reply claiming an impossible size would otherwise have the
+        # buffer wait for (and accumulate) that many bytes
+        # The size given right after "VA", or 0 when it isn't a number
+        def positional_size(tokens)
+          tokens.first == VA && tokens[1]&.match?(/\A\d+\z/) ? tokens[1].to_i : 0
+        end
+
+        def check_value_size!(size)
+          return if size.between?(0, MAX_VALUE_BYTES)
+
+          raise Dalli::DalliError, "Reply value size #{size} is out of range"
+        end
+
+        def read_line
+          @io_source.read_line&.chomp!(TERMINATOR)
+        end
+
+        def next_line_to_tokens
+          line = read_line
+          line&.split || []
+        end
+
+        def read_data(data_size)
+          # Checked before the terminator is added: -1 or -2 would otherwise
+          # read 1 or 0 bytes and leave the connection out of step
+          check_value_size!(data_size)
+          @io_source.read(data_size + TERMINATOR.bytesize)&.chomp!(TERMINATOR)
+        end
+      end
+    end
+  end
+end

@@ -1,0 +1,473 @@
+# frozen_string_literal: true
+
+require_relative 'helper'
+
+describe 'KeyManager' do
+  describe 'options' do
+    let(:key_manager) { Dalli::KeyManager.new(options) }
+
+    describe 'digest_class' do
+      describe 'when there is no explicit digest_class parameter provided' do
+        let(:options) { {} }
+
+        it 'uses Digest::MD5 as a default' do
+          assert_equal Digest::MD5, key_manager.digest_class
+        end
+      end
+
+      describe 'when there is an explicit digest_class parameter provided' do
+        describe 'and the class implements hexdigest' do
+          let(:options) { { digest_class: Digest::SHA2 } }
+
+          it 'uses the specified argument' do
+            assert_equal Digest::SHA2, key_manager.digest_class
+          end
+        end
+
+        describe 'and the class does not implement hexdigest' do
+          let(:options) { { digest_class: Object.new } }
+
+          it 'raises an argument error' do
+            err = assert_raises ArgumentError do
+              key_manager
+            end
+
+            assert_equal 'The digest_class object must respond to the hexdigest method', err.message
+          end
+        end
+      end
+    end
+
+    describe 'namespace' do
+      describe 'when there is no explicit namespace parameter provided' do
+        let(:options) { {} }
+
+        it 'the namespace is nil' do
+          assert_nil key_manager.namespace
+        end
+      end
+
+      describe 'when there is an explicit String provided as a namespace parameter' do
+        let(:options) { { namespace: namespace_as_s } }
+        let(:namespace_as_s) { SecureRandom.hex(5) }
+
+        it 'the namespace is the string' do
+          assert_equal namespace_as_s, key_manager.namespace
+        end
+      end
+
+      describe 'when there is an explicit symbol provided as a namespace parameter' do
+        let(:options) { { namespace: namespace_as_symbol } }
+        let(:namespace_as_symbol) { namespace_as_s.to_sym }
+        let(:namespace_as_s) { SecureRandom.hex(5) }
+
+        it 'the namespace is the stringified symbol' do
+          assert_equal namespace_as_s, key_manager.namespace
+        end
+      end
+
+      describe 'when there is a Proc provided as a namespace parameter' do
+        let(:options) { { namespace: namespace_as_proc } }
+        let(:namespace_as_proc) { proc { namespace_as_symbol } }
+        let(:namespace_as_symbol) { namespace_as_s.to_sym }
+        let(:namespace_as_s) { SecureRandom.hex(5) }
+
+        it 'the namespace is the proc' do
+          assert_equal namespace_as_proc, key_manager.namespace
+        end
+
+        it 'the evaluated namespace is the stringified symbol' do
+          assert_equal namespace_as_s, key_manager.evaluate_namespace
+        end
+      end
+
+      describe 'when the namespace Proc returns dynamic results' do
+        count = 0
+
+        let(:options) { { namespace: namespace_as_proc } }
+        let(:namespace_as_proc) do
+          proc { count += 1 }
+        end
+
+        it 'evaluates the namespace proc every time we need it' do
+          assert_equal 0, count
+          assert_equal '1', key_manager.evaluate_namespace
+          assert_equal(/\A2:/, key_manager.namespace_regexp)
+          assert_equal '3', key_manager.evaluate_namespace
+          assert_equal '4:test', key_manager.key_with_namespace('test')
+        end
+      end
+    end
+
+    describe 'namespace_separator' do
+      describe 'when there is no explicit namespace_separator parameter provided' do
+        let(:options) { { namespace: 'myapp' } }
+
+        it 'uses colon as default separator' do
+          assert_equal ':', key_manager.namespace_separator
+          assert_equal 'myapp:testkey', key_manager.key_with_namespace('testkey')
+        end
+      end
+
+      describe 'when there is an explicit namespace_separator parameter provided' do
+        let(:options) { { namespace: 'myapp', namespace_separator: '/' } }
+
+        it 'uses the specified separator' do
+          assert_equal '/', key_manager.namespace_separator
+          assert_equal 'myapp/testkey', key_manager.key_with_namespace('testkey')
+        end
+
+        it 'correctly strips the namespace with custom separator' do
+          assert_equal 'testkey', key_manager.key_without_namespace('myapp/testkey')
+        end
+
+        it 'uses the custom separator in namespace_regexp' do
+          assert_equal(%r{\Amyapp/}, key_manager.namespace_regexp)
+        end
+      end
+
+      describe 'when namespace_separator is used with a Proc namespace' do
+        let(:options) { { namespace: proc { 'dynamic' }, namespace_separator: '/' } }
+
+        it 'uses the custom separator with dynamic namespace' do
+          assert_equal 'dynamic/testkey', key_manager.key_with_namespace('testkey')
+          assert_equal(%r{\Adynamic/}, key_manager.namespace_regexp)
+        end
+      end
+
+      describe 'validation' do
+        it 'accepts valid separators' do
+          %w[: / | . - _ # @ ! ~ ^ & * +].each do |sep|
+            km = Dalli::KeyManager.new(namespace: 'test', namespace_separator: sep)
+
+            assert_equal sep, km.namespace_separator
+          end
+        end
+
+        it 'rejects alphanumeric separators' do
+          %w[a Z 0 9].each do |sep|
+            err = assert_raises ArgumentError do
+              Dalli::KeyManager.new(namespace: 'test', namespace_separator: sep)
+            end
+            assert_match(/non-alphanumeric/, err.message)
+          end
+        end
+
+        it 'rejects whitespace separators' do
+          [' ', "\t", "\n"].each do |sep|
+            err = assert_raises ArgumentError do
+              Dalli::KeyManager.new(namespace: 'test', namespace_separator: sep)
+            end
+            assert_match(/non-alphanumeric/, err.message)
+          end
+        end
+
+        it 'rejects multi-character separators' do
+          err = assert_raises ArgumentError do
+            Dalli::KeyManager.new(namespace: 'test', namespace_separator: '::')
+          end
+          assert_match(/single/, err.message)
+        end
+
+        it 'rejects empty string separator' do
+          err = assert_raises ArgumentError do
+            Dalli::KeyManager.new(namespace: 'test', namespace_separator: '')
+          end
+          assert_match(/single/, err.message)
+        end
+      end
+    end
+  end
+
+  describe 'validate_key' do
+    subject { key_manager.validate_key(key) }
+
+    describe 'when there is no namespace' do
+      let(:key_manager) { Dalli::KeyManager.new(options) }
+      let(:options) { {} }
+
+      describe 'when the key is nil' do
+        let(:key) { nil }
+
+        it 'raises an error' do
+          err = assert_raises ArgumentError do
+            subject
+          end
+
+          assert_equal 'key cannot be blank', err.message
+        end
+      end
+
+      describe 'when the key is empty' do
+        let(:key) { '' }
+
+        it 'raises an error' do
+          err = assert_raises ArgumentError do
+            subject
+          end
+
+          assert_equal 'key cannot be blank', err.message
+        end
+      end
+
+      describe 'when the key is blank, but not empty' do
+        let(:keylen) { rand(1..5) }
+        let(:key) { Array.new(keylen) { [' ', '\t', '\n'].sample }.join }
+
+        it 'returns the key' do
+          assert_equal key, subject
+        end
+      end
+
+      describe 'when the key is shorter than 250 characters' do
+        let(:keylen) { rand(1..250) }
+        let(:alphanum) { [('a'..'z').to_a, ('A'..'Z').to_a, ('0'..'9').to_a].flatten }
+        let(:key) { Array.new(keylen) { alphanum.sample }.join }
+
+        it 'returns the key' do
+          assert_equal keylen, key.length
+          assert_equal key, subject
+        end
+      end
+
+      describe 'when the key is longer than 250 characters' do
+        let(:keylen) { rand(251..500) }
+        let(:alphanum) { [('a'..'z').to_a, ('A'..'Z').to_a, ('0'..'9').to_a].flatten }
+        let(:key) { Array.new(keylen) { alphanum.sample }.join }
+
+        describe 'when there is no digest_class parameter' do
+          let(:truncated_key) { "#{key[0, 212]}:md5:#{Digest::MD5.hexdigest(key)}" }
+
+          it 'returns the truncated key' do
+            assert_equal 249, subject.length
+            assert_equal truncated_key, subject
+          end
+        end
+
+        describe 'when there is a custom digest_class parameter' do
+          let(:options) { { digest_class: Digest::SHA2 } }
+          let(:truncated_key) { "#{key[0, 180]}:md5:#{Digest::SHA2.hexdigest(key)}" }
+
+          it 'returns the truncated key' do
+            assert_equal 249, subject.length
+            assert_equal truncated_key, subject
+          end
+        end
+      end
+    end
+
+    describe 'when there is a namespace' do
+      let(:key_manager) { Dalli::KeyManager.new(options) }
+      let(:half_namespace_len) { rand(1..5) }
+      let(:namespace_as_s) { SecureRandom.hex(half_namespace_len) }
+      let(:options) { { namespace: namespace_as_s } }
+
+      describe 'when the key is nil' do
+        let(:key) { nil }
+
+        it 'raises an error' do
+          err = assert_raises ArgumentError do
+            subject
+          end
+
+          assert_equal 'key cannot be blank', err.message
+        end
+      end
+
+      describe 'when the key is empty' do
+        let(:key) { '' }
+
+        it 'raises an error' do
+          err = assert_raises ArgumentError do
+            subject
+          end
+
+          assert_equal 'key cannot be blank', err.message
+        end
+      end
+
+      describe 'when the key is blank, but not empty' do
+        let(:keylen) { rand(1..5) }
+        let(:key) { Array.new(keylen) { [' ', '\t', '\n'].sample }.join }
+
+        it 'returns the key' do
+          assert_equal "#{namespace_as_s}:#{key}", subject
+        end
+      end
+
+      describe 'when the key with namespace is shorter than 250 characters' do
+        # The stored key is "<namespace>:<key>", and KeyManager truncates when
+        # that exceeds 250 characters.  The namespace is SecureRandom.hex, so it
+        # is twice half_namespace_len; with the separator that leaves 249 - it
+        # for the key itself.  Generating up to 250 - it produced a 251
+        # character key roughly one run in 250, which truncated and failed.
+        let(:keylen) { rand(1..(249 - (half_namespace_len * 2))) }
+        let(:alphanum) { [('a'..'z').to_a, ('A'..'Z').to_a, ('0'..'9').to_a].flatten }
+        let(:key) { Array.new(keylen) { alphanum.sample }.join }
+
+        it 'returns the key' do
+          assert_equal keylen, key.length
+          assert_equal "#{namespace_as_s}:#{key}", subject
+        end
+      end
+
+      describe 'when the key with namespace is longer than 250 characters' do
+        let(:keylen) { rand(251..500) - (half_namespace_len * 2) }
+        let(:alphanum) { [('a'..'z').to_a, ('A'..'Z').to_a, ('0'..'9').to_a].flatten }
+        let(:key) { Array.new(keylen) { alphanum.sample }.join }
+
+        describe 'when there is no digest_class parameter' do
+          let(:key_prefix) { key[0, 212 - (half_namespace_len * 2)] }
+          let(:truncated_key) do
+            "#{namespace_as_s}:#{key_prefix}:md5:#{Digest::MD5.hexdigest("#{namespace_as_s}:#{key}")}"
+          end
+
+          it 'returns the truncated key' do
+            assert_equal 250, subject.length
+            assert_equal truncated_key, subject
+          end
+        end
+
+        describe 'when there is a custom digest_class parameter' do
+          let(:options) { { digest_class: Digest::SHA2, namespace: namespace_as_s } }
+          let(:key_prefix) { key[0, 180 - (half_namespace_len * 2)] }
+          let(:truncated_key) do
+            "#{namespace_as_s}:#{key_prefix}:md5:#{Digest::SHA2.hexdigest("#{namespace_as_s}:#{key}")}"
+          end
+
+          it 'returns the truncated key' do
+            assert_equal 250, subject.length
+            assert_equal truncated_key, subject
+          end
+        end
+      end
+    end
+  end
+
+  # memcached's 250-byte limit applies to the key as sent: in bytes, and after
+  # base64 encoding for keys with whitespace or non-ASCII characters. A key
+  # within the limit in characters could still be rejected with CLIENT_ERROR.
+  describe 'validate_key wire length' do
+    let(:key_manager) { Dalli::KeyManager.new({}) }
+
+    def wire_bytes(key)
+      return key.bytesize unless Dalli::Protocol::Meta::KeyRegularizer.required?(key)
+
+      Dalli::Protocol::Meta::KeyRegularizer.encode(key).bytesize
+    end
+
+    it 'leaves keys that fit on the wire unchanged' do
+      # 186 raw bytes is the most that base64-encodes within 250 bytes
+      ['a' * 250, "#{'k' * 184} x", 'é' * 93].each do |key|
+        assert_equal key, key_manager.validate_key(key)
+      end
+    end
+
+    it 'truncates keys that are short enough in characters but too long once base64-encoded' do
+      ["search:#{'é' * 130}", 'é' * 250, "#{'k' * 185} x", ' ' * 260, '😀' * 100].each do |key|
+        validated = key_manager.validate_key(key)
+
+        refute_equal key, validated
+        assert_operator wire_bytes(validated), :<=, 250,
+                        "#{key[0, 20].inspect} is #{wire_bytes(validated)} bytes on the wire"
+        assert_includes validated, ':md5:'
+      end
+    end
+
+    it 'raises rather than looping or returning an over-long key for a digest that is too long' do
+      wide = Module.new { def self.hexdigest(_) = "\xFF".b * 200 }
+      long = Module.new { def self.hexdigest(_) = 'f' * 300 }
+
+      [wide, long].each do |digest|
+        manager = Dalli::KeyManager.new({ digest_class: digest })
+
+        assert_raises(ArgumentError) { Timeout.timeout(2) { manager.validate_key('a' * 300) } }
+      end
+    end
+
+    it 'gives different keys different truncated forms' do
+      a = key_manager.validate_key('é' * 200)
+      b = key_manager.validate_key("#{'é' * 199}è")
+
+      refute_equal a, b
+    end
+  end
+
+  describe 'key_with_namespace' do
+    let(:raw_key) { SecureRandom.hex(10) }
+    let(:key_manager) { Dalli::KeyManager.new(options) }
+    subject { key_manager.key_with_namespace(raw_key) }
+
+    describe 'without namespace' do
+      let(:options) { {} }
+
+      it 'returns the argument' do
+        assert_equal raw_key, subject
+      end
+    end
+
+    describe 'with namespace' do
+      let(:namespace_as_s) { SecureRandom.hex(5) }
+      let(:options) { { namespace: namespace_as_s } }
+
+      it 'returns the argument with the namespace prepended' do
+        assert_equal "#{namespace_as_s}:#{raw_key}", subject
+      end
+    end
+  end
+
+  describe 'key_without_namespace' do
+    let(:key_manager) { Dalli::KeyManager.new(options) }
+    subject { key_manager.key_without_namespace(raw_key) }
+
+    describe 'without namespace' do
+      let(:options) { {} }
+
+      describe 'when the key has no colon' do
+        let(:raw_key) { SecureRandom.hex(10) }
+
+        it 'returns the argument' do
+          assert_equal raw_key, subject
+        end
+      end
+
+      describe 'when the key has a colon' do
+        let(:raw_key) { "#{SecureRandom.hex(5)}:#{SecureRandom.hex(10)}" }
+
+        it 'returns the argument' do
+          assert_equal raw_key, subject
+        end
+      end
+    end
+
+    describe 'with namespace' do
+      let(:namespace_as_s) { SecureRandom.hex(5) }
+      let(:options) { { namespace: namespace_as_s } }
+
+      describe 'when the argument starts with the namespace' do
+        let(:key_wout_namespace) { SecureRandom.hex(5) }
+        let(:raw_key) { "#{namespace_as_s}:#{key_wout_namespace}" }
+
+        it 'strips the namespace' do
+          assert_equal key_wout_namespace, subject
+        end
+      end
+
+      describe 'when the argument includes the namespace in a position other than the start' do
+        let(:raw_key) { "#{SecureRandom.hex(5)}#{namespace_as_s}:#{SecureRandom.hex(5)}" }
+
+        it 'returns the argument' do
+          assert_equal raw_key, subject
+        end
+      end
+
+      describe 'when the argument does not include the namespace' do
+        let(:raw_key) { SecureRandom.hex(10) }
+
+        it 'returns the argument' do
+          assert_equal raw_key, subject
+        end
+      end
+    end
+  end
+end

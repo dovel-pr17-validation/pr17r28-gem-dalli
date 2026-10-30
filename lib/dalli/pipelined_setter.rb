@@ -1,0 +1,108 @@
+# frozen_string_literal: true
+
+module Dalli
+  ##
+  # Contains logic for the pipelined set operations implemented by the client.
+  # Efficiently writes multiple key-value pairs by grouping requests by server
+  # and using quiet mode to minimize round trips.
+  ##
+  class PipelinedSetter
+    def initialize(ring, key_manager)
+      @ring = ring
+      @key_manager = key_manager
+    end
+
+    ##
+    # Writes multiple key-value pairs to memcached.
+    #
+    # A transient network error is retried automatically. If a server remains
+    # unreachable after retrying, raises Dalli::NetworkError.
+    #
+    # A value that can't be marshalled or is over value_max_bytes is skipped;
+    # the other keys are still stored, then the first such error is raised.
+    #
+    # @param hash [Hash] key-value pairs to set
+    # @param ttl [Integer] time-to-live in seconds
+    # @param req_options [Hash] options passed to each set operation
+    # @return [void]
+    ##
+    def process(hash, ttl, req_options)
+      return if hash.empty?
+
+      @value_error = nil
+      @ring.lock do
+        servers = setup_requests(hash, ttl, req_options)
+        finish_requests(servers)
+      end
+      raise @value_error if @value_error
+    rescue Dalli::RetryableNetworkError => e
+      Dalli.logger.debug { e.inspect }
+      Dalli.logger.debug { 'retrying pipelined sets because of network error' }
+      retry
+    end
+
+    private
+
+    # Values are looked up by each key as sent. The caller's key can't be
+    # rebuilt from it: a long key is digested, and a Symbol becomes a String.
+    def setup_requests(hash, ttl, req_options)
+      pairs = hash.transform_keys { |k| @key_manager.validate_key(k.to_s) }
+      groups = groups_for_keys(pairs.keys)
+      make_set_requests(groups, pairs, ttl, req_options)
+      groups.keys
+    end
+
+    ##
+    # Loop through the server-grouped sets of keys, writing
+    # the corresponding quiet set requests to the appropriate servers
+    ##
+    # NetworkError (which RetryableNetworkError subclasses) must propagate: the
+    # top-level rescue in #process retries the whole pipelined set on it. A
+    # combined `rescue DalliError, NetworkError` would silently swallow
+    # RetryableNetworkError too -- since NetworkError < DalliError -- dropping
+    # this server's keys on a transient hiccup instead of retrying. Only a
+    # non-network DalliError should be swallowed here.
+    def make_set_requests(groups, pairs, ttl, req_options)
+      groups.each do |server, keys_for_server|
+        keys_for_server.each do |key|
+          server.request(:pipelined_set, key, pairs[key], ttl, req_options)
+        rescue Dalli::NetworkError
+          raise
+        rescue Dalli::MarshalError, Dalli::ValueOverMaxSize => e
+          # Nothing was written for this key, so the server's other keys are
+          # unaffected; raised by #process once the batch is complete
+          @value_error ||= e
+        rescue DalliError => e
+          Dalli.logger.debug { e.inspect }
+          Dalli.logger.debug { "unable to set key #{key} for server #{server.name}" }
+        end
+      end
+    end
+
+    ##
+    # Sends noop to each server to flush responses and ensure all writes complete.
+    ##
+    def finish_requests(servers)
+      servers.each do |server|
+        server.request(:noop)
+      rescue Dalli::NetworkError
+        raise
+      rescue DalliError => e
+        Dalli.logger.debug { e.inspect }
+        Dalli.logger.debug { "unable to complete pipelined set on server #{server.name}" }
+      end
+    end
+
+    def groups_for_keys(keys)
+      groups = @ring.keys_grouped_by_server(keys)
+
+      if (unfound_keys = groups.delete(nil))
+        Dalli.logger.debug do
+          "unable to set #{unfound_keys.length} keys because no matching server was found"
+        end
+      end
+
+      groups
+    end
+  end
+end

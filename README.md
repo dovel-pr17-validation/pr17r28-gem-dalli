@@ -1,0 +1,254 @@
+Dalli [![Tests](https://github.com/petergoldstein/dalli/actions/workflows/tests.yml/badge.svg)](https://github.com/petergoldstein/dalli/actions/workflows/tests.yml)
+=====
+
+Dalli is a high performance pure Ruby client for accessing memcached servers.
+
+Dalli supports:
+
+* Simple and complex memcached configurations
+* Failover between memcached instances
+* Fine-grained control of data serialization and compression
+* Thread-safe operation (either through use of a connection pool, or by using the Dalli client in threadsafe mode)
+* SSL/TLS connections to memcached
+* OpenTelemetry distributed tracing (automatic when SDK is present)
+
+The name is a variant of Salvador Dali for his famous painting [The Persistence of Memory](http://en.wikipedia.org/wiki/The_Persistence_of_Memory).
+
+## Requirements
+
+* Ruby 3.3 or later (JRuby also supported)
+* memcached 1.6.27 or later
+
+Dalli is tested against both the minimum supported memcached version and the
+latest release. Earlier 1.6.x servers are not supported: the meta protocol
+rejects unknown flags outright, so features added after a server's release fail
+with `CLIENT_ERROR invalid flag` rather than degrading.
+
+### Known Ruby issue: crash on an interrupted socket read
+
+Dalli sets socket timeouts with `IO#timeout`. Ruby 3.3.0–3.3.7 and 3.4.0–3.4.2 have a bug ([Ruby #21195](https://bugs.ruby-lang.org/issues/21195)) where a timed read interrupted by a signal aborts the whole process:
+
+```
+[BUG] rb_sys_fail_path_in(io_fillbuf, fd:N ) - errno == 0
+```
+
+The crash is inside Ruby itself, so it can't be rescued. It's fixed in Ruby 3.3.8 and 3.4.3. If you see this crash, upgrade to one of those versions or later.
+
+## Configuration Options
+
+### Namespace
+
+Use namespaces to partition your cache and avoid key collisions between different applications or environments:
+
+```ruby
+# All keys will be prefixed with "myapp:"
+Dalli::Client.new('localhost:11211', namespace: 'myapp')
+
+# Dynamic namespace using a Proc (evaluated on each operation)
+Dalli::Client.new('localhost:11211', namespace: -> { "tenant:#{Thread.current[:tenant_id]}" })
+```
+
+### Namespace Separator
+
+By default, the namespace and key are joined with a colon (`:`). You can customize this with the `namespace_separator` option:
+
+```ruby
+# Keys will be prefixed with "myapp/" instead of "myapp:"
+Dalli::Client.new('localhost:11211', namespace: 'myapp', namespace_separator: '/')
+```
+
+The separator must be a single non-alphanumeric character. Valid examples: `:`, `/`, `|`, `.`, `-`, `_`, `#`
+
+### Maximum Item Size
+
+memcached rejects items larger than its `-I` setting (1MB by default). Set `value_max_bytes` to the same value if you change it:
+
+```ruby
+# memcached started with -I 2m
+Dalli::Client.new('localhost:11211', value_max_bytes: 2 * 1024 * 1024)
+```
+
+memcached's limit covers the whole item, so Dalli checks the stored (serialized and compressed) value plus the key plus 63 bytes of per-item overhead against `value_max_bytes`, and raises `Dalli::ValueOverMaxSize` before sending anything larger. With the defaults, the largest value you can store under a 10-byte key is 1,048,576 - 10 - 63 = 1,048,503 bytes.
+
+### Deferred Draining
+
+By default, a `quiet` (or `multi`) block ends by waiting for the replies memcached still sends for its quiet requests, one round trip for each server the block wrote to. With `defer_drain: true`, the block returns without waiting:
+
+```ruby
+dc = Dalli::Client.new('localhost:11211', defer_drain: true)
+
+dc.quiet { dc.set('key', 'value') } # returns without a round trip
+dc.get('key')                       # first drains that connection with a noop, then gets the value
+```
+
+The requests are still sent right away. Their replies stay unread on the connection until the next non-quiet request to that server, which reads them first with one `noop`. Error replies to quiet requests are discarded either way. With `defer_drain` they're discarded at that later point instead of at the end of the block.
+
+**Replies accumulate until a non-quiet request drains them.** memcached still replies to some quiet requests: `NF` for a quiet `delete`, `incr` or `decr` of a missing key, `NS` for an `add` or `replace` that didn't store, and error replies. Those replies wait on the socket. A client that mixes quiet writes with reads (or other non-quiet requests) to the same servers drains them as it goes, and needs nothing more.
+
+A client that only ever makes quiet requests, such as a worker that only issues quiet deletes, never sends that next request. Its unread replies keep growing, and if they fill the connection's socket buffers, the connection can stall until a socket timeout closes it and Dalli reconnects. Workloads like that should call `drain_deferred_responses` periodically, for example after each batch or job:
+
+```ruby
+jobs.each do |job|
+  job.keys.each { |key| dc.quiet { dc.delete(key) } }
+  dc.drain_deferred_responses # reads and discards the replies waiting on each server
+end
+```
+
+`drain_deferred_responses` only sends a `noop` to servers that were sent quiet requests since they were last drained, so calling it when nothing is pending costs nothing.
+
+## Network Errors and Retries
+
+When a request fails with a network error (a refused connection, a reset, or a read that times out), Dalli reconnects and retries it. A server that fails `socket_max_failures` times in a row is marked down, and requests to it raise `Dalli::NetworkError` (or, with `failover`, go to another server).
+
+A request that failed after some of it was sent may have been applied by memcached even though its reply never arrived. Dalli only sends such a request again when applying it twice is harmless: reads, `touch`, `set`, `replace` and `delete` without a CAS, and the multi-key operations. For `incr`, `decr`, `append`, `prepend`, `add`, writes with a CAS (`set_cas`, `replace_cas`, `delete_cas`, `cas`, `cas!`), and `get_with_metadata` with `vivify_ttl` or `recache_ttl` (which `fetch_with_lock` uses), it raises `Dalli::NetworkError` instead, since the write may or may not have happened. A retried `delete` can return false if the first attempt deleted the key.
+
+## Security Note
+
+By default, Dalli uses Ruby's Marshal for serialization. Deserializing untrusted data with Marshal can lead to remote code execution. If you cache user-controlled data, consider using a safer serializer:
+
+```ruby
+Dalli::Client.new('localhost:11211', serializer: Dalli::JSONSerializer)
+```
+
+`Dalli::JSONSerializer` reads values with `JSON.parse`, so it only ever returns plain hashes, arrays, strings, numbers, booleans and `nil`. Passing the `JSON` module itself (`serializer: JSON`) reads values with `JSON.load`, which can create objects of other classes from a stored `json_class` key and is not recommended for data an attacker might write.
+
+Per-request `raw: true` returns the stored bytes without deserializing or decompressing them, on every read method (`get`, `get_multi`, `get_cas`, `get_with_metadata` and `fetch`).
+
+### Long keys
+
+memcached limits keys to 250 bytes. Dalli shortens a longer key (counting its namespace) to the start of the key, followed by `:md5:` and a hex digest of the whole key:
+
+```ruby
+dc.set("report:#{'x' * 300}", 'data')
+# stored under "report:xxx...xxx:md5:<32 hex characters>"
+```
+
+The shortened key is an ordinary memcached key, so a short key written in exactly that form names the same item, and reading or writing it reads or overwrites the long key's value. This only matters if untrusted input can choose an entire cache key. If it can, hash the untrusted part yourself so the key never needs shortening, or reject keys that contain `:md5:`.
+
+The digest is MD5 by default. `digest_class:` takes any object that responds to `hexdigest`, such as `Digest::SHA256`. Changing it renames every shortened key, so existing entries for long keys are missed once.
+
+See the [5.0-Upgrade.md](5.0-Upgrade.md) guide for upgrade information.
+
+### Counters and verify_reply_keys
+
+memcached names an item made by auto-create for a base64-encoded key (one with whitespace, control or non-ASCII characters) by its raw key bytes in later replies. Since 5.2.3, Dalli creates counters for such keys with an add rather than auto-create. Items created before then, or by other clients, can still be named that way until memcached releases a fix (1.6.45 and earlier behave this way). If keys passed to `incr` or `decr` with an initial value can contain untrusted input, set `verify_reply_keys: true` until then: multi-gets then ignore replies for keys they didn't request, at a cost of about 15% per multi-get.
+
+## TLS
+
+Pass an `OpenSSL::SSL::SSLContext` as `ssl_context:` to connect over TLS. Certificate and hostname verification come only from that context: Dalli adds no checks of its own. A bare `OpenSSL::SSL::SSLContext.new` verifies nothing, so it accepts any certificate from any server. Configure the context to verify both:
+
+```ruby
+ssl_context = OpenSSL::SSL::SSLContext.new
+ssl_context.set_params(
+  verify_mode: OpenSSL::SSL::VERIFY_PEER,
+  verify_hostname: true,
+  ca_file: '/path/to/ca.crt' # omit to use the system's trusted certificates
+)
+
+Dalli::Client.new('memcached.example.com:11211', ssl_context: ssl_context)
+```
+
+Dalli logs a warning once per process when the context's `verify_mode` is `VERIFY_NONE`, or when it is `VERIFY_PEER` but `verify_hostname` is false.
+
+A failed TLS handshake counts as a failed connection attempt, like a refused connection: once `socket_max_failures` attempts have failed, the server is marked down and requests fail over to the other servers.
+
+## Rack Sessions
+
+`Rack::Session::Dalli` stores Rack sessions in memcached. If a session is deleted while a request is using it (for example, when the user logs out in another tab during a slow request), the store doesn't write the session back, so a logged-out session can't come back. It replaces the app's response with a `401 Wrong session ID` that expires the session cookie.
+
+The app has already run by then, so whatever it did (database writes, emails, and so on) has happened, and only its response is lost. If a request needs a different outcome, check that the session still exists before making the changes.
+
+## OpenTelemetry Tracing
+
+Dalli automatically instruments operations with [OpenTelemetry](https://opentelemetry.io/) when the SDK is present. No configuration is required - just add the OpenTelemetry gems to your application:
+
+```ruby
+# Gemfile
+gem 'opentelemetry-sdk'
+gem 'opentelemetry-exporter-otlp' # or your preferred exporter
+```
+
+When OpenTelemetry is loaded, Dalli creates spans for:
+- Single key operations: `get`, `set`, `delete`, `add`, `replace`, `incr`, `decr`, etc.
+- Multi-key operations: `get_multi`, `set_multi`, `delete_multi`
+- Advanced operations: `get_with_metadata`, `fetch_with_lock`
+
+### Span Attributes
+
+All spans include:
+- `db.system`: `memcached`
+- `db.operation`: The operation name (e.g., `get`, `set_multi`)
+
+Single-key operations also include:
+- `server.address`: The memcached server that handled the request (e.g., `localhost:11211`)
+
+Multi-key operations include cache efficiency metrics:
+- `db.memcached.key_count`: Number of keys in the request
+- `db.memcached.hit_count`: Number of keys found (for `get_multi`)
+- `db.memcached.miss_count`: Number of keys not found (for `get_multi`)
+
+### Error Handling
+
+Exceptions are automatically recorded on spans with error status. When an operation fails:
+1. The exception is recorded on the span via `span.record_exception(e)`
+2. The span status is set to error with the exception message
+3. The exception is re-raised to the caller
+
+### Disabling Instrumentation
+
+To disable instrumentation at runtime (e.g., in tests or specific environments):
+
+```ruby
+Dalli::Instrumentation.disable!
+```
+
+You can also assign a custom tracer directly:
+
+```ruby
+Dalli::Instrumentation.tracer = my_custom_tracer
+```
+
+### Zero Overhead
+
+When OpenTelemetry is not present, there is zero overhead - the tracing code checks once at startup and bypasses all instrumentation logic entirely when the SDK is not loaded.
+
+![Persistence of Memory](https://upload.wikimedia.org/wikipedia/en/d/dd/The_Persistence_of_Memory.jpg)
+
+
+## Documentation and Information
+
+* [User Documentation](https://github.com/petergoldstein/dalli/wiki) - The documentation is maintained in the repository's wiki.  
+* [Announcements](https://github.com/petergoldstein/dalli/discussions/categories/announcements) - Announcements of interest to the Dalli community will be posted here.
+* [Bug Reports](https://github.com/petergoldstein/dalli/issues) - If you discover a problem with Dalli, please submit a bug report in the tracker.
+* [Forum](https://github.com/petergoldstein/dalli/discussions/categories/q-a) - If you have questions about Dalli, please post them here.
+* [Client API](https://www.rubydoc.info/gems/dalli) - Ruby documentation for the `Dalli::Client` API
+
+## Development
+
+After checking out the repo, run `bin/setup` to install dependencies. You can run `bin/console` for an interactive prompt that will allow you to experiment.
+
+To install this gem onto your local machine, run `bundle exec rake install`.
+
+## Contributing
+
+Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute, including our policy on AI-authored contributions.
+
+## Appreciation
+
+Dalli would not exist in its current form without the contributions of many people.  But special thanks go to several individuals and organizations:
+
+* Mike Perham - for originally authoring the Dalli project and serving as maintainer and primary contributor for many years
+* Eric Wong - for help using his [kgio](http://bogomips.org/kgio/) library.
+* Brian Mitchell - for his remix-stash project which was helpful when implementing and testing the binary protocol support.
+* [CouchBase](http://couchbase.com) - for their sponsorship of the original development
+
+
+## Authors
+
+* [Peter M. Goldstein](https://github.com/petergoldstein) - current maintainer
+* [Mike Perham](https://github.com/mperham) and contributors
+
+
+## Copyright
+
+Copyright (c) Mike Perham, Peter M. Goldstein. See LICENSE for details.

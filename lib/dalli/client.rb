@@ -1,0 +1,1155 @@
+# frozen_string_literal: true
+
+require 'digest/md5'
+
+module Dalli
+  ##
+  # Dalli::Client is the main class which developers will use to interact with
+  # Memcached.
+  ##
+  class Client
+    ##
+    # Dalli::Client is the main class which developers will use to interact with
+    # the memcached server.  Usage:
+    #
+    #   Dalli::Client.new(['localhost:11211:10',
+    #                      'cache-2.example.com:11211:5',
+    #                      '192.168.0.1:22122:5',
+    #                      '/var/run/memcached/socket'],
+    #                     failover: true, expires_in: 300)
+    #
+    # servers is an Array of "host:port:weight" where weight allows you to distribute cache unevenly.
+    # Both weight and port are optional.  If you pass in nil, Dalli will use the <tt>MEMCACHE_SERVERS</tt>
+    # environment variable or default to 'localhost:11211' if it is not present.  Dalli also supports
+    # the ability to connect to Memcached on localhost through a UNIX socket.  To use this functionality,
+    # use a full pathname (beginning with a slash character '/') in place of the "host:port" pair in
+    # the server configuration.
+    #
+    # Options:
+    # - :namespace - prepend each key with this value to provide simple namespacing.
+    # - :failover - if a server is down, look for and store values on another server in the ring.  Default: true.
+    # - :threadsafe - ensure that only one thread is actively using a socket at a time. Default: true.
+    # - :expires_in - default TTL in seconds if you do not pass TTL as a parameter to an individual operation, defaults
+    #                 to 0 or forever.
+    # - :compress - if true Dalli will compress values larger than compression_min_size bytes before sending them
+    #               to memcached.  Default: true.
+    # - :compression_min_size - the minimum size (in bytes) for which Dalli will compress values sent to Memcached.
+    #                           Defaults to 4K.
+    # - :value_max_bytes - the largest item memcached will accept, i.e. its -I setting. Defaults to 1MB. Like
+    #                     memcached, Dalli counts the key and 63 bytes of item overhead against this limit along
+    #                     with the (serialized, compressed) value, so the largest value that can be stored is
+    #                     value_max_bytes - key bytesize - 63. Larger values raise Dalli::ValueOverMaxSize.
+    # - :serializer - defaults to Marshal
+    # - :compressor - defaults to Dalli::Compressor, a Zlib-based implementation
+    # - :cache_nils - defaults to false, if true Dalli will not treat cached nil values as 'not found' for
+    #                 #fetch operations.
+    # - :raw        - If set, disables serialization and compression entirely at the client level.
+    #                 Only String values are supported. This is useful when the caller handles its own
+    #                 serialization (e.g., Rails' ActiveSupport::Cache). The per-request :raw option
+    #                 (e.g. set(key, value, ttl, raw: true)) does the same for a single call: String
+    #                 values are stored as-is, uncompressed, and non-String values raise
+    #                 Dalli::MarshalError.
+    # - :digest_class - defaults to Digest::MD5, allows you to pass in an object that responds to the hexdigest method,
+    #                   useful for injecting a FIPS compliant hash object.
+    # - :otel_db_statement - controls the +db.query.text+ span attribute when OpenTelemetry is loaded.
+    #                        +:include+ logs the full operation and key(s), +:obfuscate+ replaces keys with "?",
+    #                        +nil+ (default) omits the attribute entirely.
+    # - :otel_peer_service - when set, adds a +peer.service+ span attribute with this value for logical service naming.
+    # - :defer_drain - defaults to false. When true, a quiet/multi block no longer waits at its end for the replies
+    #                  to its requests. The requests are still sent right away; their replies are read (with one noop
+    #                  per server) just before the next non-quiet request to that server, or by
+    #                  #drain_deferred_responses. The tradeoff: an error reply to a quiet request surfaces, and is
+    #                  discarded, at that later point rather than when the block ends. Replies memcached sends for
+    #                  quiet requests (NF, NS, errors) wait on the connection until then, so a client that only makes
+    #                  quiet requests should call #drain_deferred_responses periodically. See "Deferred Draining" in
+    #                  the README.
+    # - :socket_timeout - timeout in seconds for reads and writes on a connection, and for the TLS
+    #                     handshake. Also used for connecting unless :connect_timeout is set.
+    #                     Default: 1.
+    # - :connect_timeout - timeout in seconds for DNS resolution and TCP/UNIX socket connects,
+    #                      including reconnects after a failure. Defaults to :socket_timeout.
+    #                      TLS handshakes use :socket_timeout.
+    # - :verify_reply_keys - defaults to false. When true, get_multi, get_multi_cas and get_multi_with_metadata only
+    #                        accept replies for the keys they requested; after a reply naming another key, the rest of
+    #                        that server's replies are treated as misses. memcached can name an item by its raw key
+    #                        bytes when the item was created by auto-create from a base64-encoded key, which Dalli no
+    #                        longer does. Costs a multi-get about 15%.
+    #
+    def initialize(servers = nil, options = {})
+      @normalized_servers = ::Dalli::ServersArgNormalizer.normalize_servers(servers)
+      @options = normalize_options(options)
+      warn_removed_options(@options)
+      @key_manager = ::Dalli::KeyManager.new(@options)
+      @ring = nil
+    end
+
+    #
+    # The standard memcached instruction set
+    #
+
+    ##
+    # Get the value associated with the key.
+    # If a value is not found, then +nil+ is returned.
+    def get(key, req_options = nil)
+      validate_routing_tokens!(req_options)
+      perform(:get, key, req_options)
+    end
+
+    ##
+    # Gat (get and touch) fetch an item and simultaneously update its expiration time.
+    #
+    # If a value is not found, then +nil+ is returned.
+    def gat(key, ttl = nil, req_options = nil)
+      validate_routing_tokens!(req_options)
+      perform(:gat, key, ttl_or_default(ttl), req_options)
+    end
+
+    ##
+    # Touch updates expiration time for a given key.
+    #
+    # Returns true if key exists, otherwise nil.
+    def touch(key, ttl = nil)
+      resp = perform(:touch, key, ttl_or_default(ttl))
+      resp.nil? ? nil : true
+    end
+
+    ##
+    # Get the value and CAS ID associated with the key.  If a block is provided,
+    # value and CAS will be passed to the block.
+    def get_cas(key, req_options = nil)
+      validate_routing_tokens!(req_options)
+      (value, cas) = perform(:cas, key, req_options)
+      return [value, cas] unless block_given?
+
+      yield value, cas
+    end
+
+    ##
+    # Get value with extended metadata.
+    #
+    # @param key [String] the cache key
+    # @param options [Hash] options controlling what metadata to return
+    #   - :return_cas [Boolean] return the CAS value (default: true)
+    #   - :return_hit_status [Boolean] return whether item was previously accessed
+    #   - :return_last_access [Boolean] return seconds since last access
+    #   - :return_ttl_remaining [Boolean] return seconds of TTL remaining (-1 if no TTL)
+    #   - :skip_lru_bump [Boolean] don't bump LRU or update access stats
+    #   - :vivify_ttl [Integer] on a miss, create a stub that lives this long
+    #     (sanitized like any other TTL) and report won_recache
+    #   - :recache_ttl [Integer] report won_recache when the item's remaining
+    #     TTL is below this
+    #
+    # @return [Hash] containing:
+    #   - :value - the cached value (or nil on miss)
+    #   - :cas - the CAS value
+    #   - :miss - true when the key does not exist.  Always present.  Prefer it
+    #     over a nil :value, which cannot distinguish a miss from a stored nil
+    #     under cache_nils
+    #   - :hit_before - true/false if previously accessed (only if return_hit_status: true)
+    #   - :last_access - seconds since last access (only if return_last_access: true)
+    #   - :ttl_remaining - seconds of TTL remaining, -1 when the item has no
+    #     expiry (only if return_ttl_remaining: true)
+    #
+    # @example Get with hit status
+    #   result = client.get_with_metadata('key', return_hit_status: true)
+    #   # => { value: "data", cas: 123, miss: false, hit_before: true }
+    #
+    # @example Get with all metadata without affecting LRU
+    #   result = client.get_with_metadata('key',
+    #     return_hit_status: true,
+    #     return_last_access: true,
+    #     skip_lru_bump: true
+    #   )
+    #   # => { value: "data", cas: 123, hit_before: true, last_access: 42 }
+    #
+    def get_with_metadata(key, options = {})
+      validate_routing_tokens!(options)
+      validate_ttl!(:vivify_ttl, options[:vivify_ttl])
+      # A retry re-runs this method with its original arguments, so `key` must
+      # stay as the caller gave it; reassigning it would add the namespace again.
+      validated_key = @key_manager.validate_key(key.to_s)
+
+      server = ring.server_for_key(validated_key)
+      Instrumentation.trace('get_with_metadata', trace_attrs('get_with_metadata', validated_key, server)) do
+        server.request(:meta_get, validated_key, options)
+      end
+    # Only a retryable error is retried. The NetworkError raised when a server
+    # is marked down is final, as in #perform; retrying it looped forever once
+    # down_retry_delay let the same server be tried again.
+    rescue RetryableNetworkError => e
+      Dalli.logger.debug { e.inspect }
+      Dalli.logger.debug { 'retrying get_with_metadata with new server' }
+      retry
+    end
+
+    ##
+    # Like #get_with_metadata, but wraps the result in a Dalli::CacheResult
+    # instead of returning a Hash.
+    #
+    # Interim adapter (see #1130 / #1151): #get_with_metadata itself keeps
+    # returning a Hash, since changing that return type is a breaking change
+    # reserved for a future major version. This lets callers opt in to the
+    # structured shape today.
+    #
+    # @param key [String] the cache key
+    # @param options [Hash] see #get_with_metadata
+    # @return [Dalli::CacheResult]
+    def get_with_metadata_result(key, options = {})
+      CacheResult.new(get_with_metadata(key, options))
+    end
+
+    ##
+    # Fetch multiple keys efficiently.
+    # If a block is given, yields key/value pairs one at a time.
+    # Otherwise returns a hash of { 'key' => 'value', 'key2' => 'value1' }
+    #
+    # `req_options` accepts :p_token/:l_token, applied to every key in the batch.
+    #
+    # A transient network error is retried automatically. If a server remains
+    # unreachable after retrying, raises Dalli::NetworkError rather than
+    # silently omitting that server's keys from the result.
+    #
+    # @raise [Dalli::NetworkError] if a server is unreachable after retrying
+    # rubocop:disable-next Style/ExplicitBlockArgument
+    def get_multi(*keys, req_options: nil)
+      keys.flatten!
+      keys.compact!
+      return {} if keys.empty?
+
+      validate_routing_tokens!(req_options)
+
+      if block_given?
+        get_multi_yielding(keys, req_options) { |k, v| yield k, v }
+      else
+        get_multi_hash(keys, req_options)
+      end
+    end
+
+    ##
+    # Fetch multiple keys efficiently, returning a stale-aware metadata Hash per
+    # key.  If a block is given, yields key/metadata pairs one at a time.
+    #
+    # Like #get_multi and #get_multi_cas, keys that were not found are omitted
+    # from the result -- absence is the miss.  A tombstoned item (see #delete
+    # with the meta protocol's invalidate flag) is *not* a miss: it is returned
+    # with stale: true, possibly with an empty value, which is the distinction
+    # stale-aware callers need.
+    #
+    #   client.get_multi_with_metadata('a', 'b', 'absent')
+    #   # => { 'a' => { value: 'v', cas: 12, stale: false, miss: false },
+    #   #      'b' => { value: '',  cas: 13, stale: true,  miss: false } }
+    #
+    # Missing keys are `requested - result.keys`.
+    #
+    # Result key order matches request order only when every key lands on the
+    # same server; across multiple servers it follows per-server response
+    # order instead, the same as #get_multi.
+    #
+    # `req_options` accepts :p_token/:l_token, applied to every key in the batch.
+    #
+    # A transient network error is retried automatically. If a server remains
+    # unreachable after retrying, raises Dalli::NetworkError rather than
+    # returning its keys as misses or yielding a partial result.
+    #
+    # @param keys [Array<String>] the keys to fetch
+    # @param req_options [Hash, nil] routing-token options
+    # @return [Hash] key => { value:, cas:, stale:, miss: }
+    # @raise [Dalli::NetworkError] if a server is unreachable after retrying
+    def get_multi_with_metadata(*keys, req_options: nil, &block)
+      keys.flatten!
+      keys.compact!
+      return {} if keys.empty?
+
+      validate_routing_tokens!(req_options)
+
+      results = Instrumentation.trace('get_multi_with_metadata',
+                                      multi_trace_attrs('get_multi_with_metadata', keys.size, keys)) do
+        if ring.servers.size == 1
+          single_server_get_multi_with_metadata(keys, req_options)
+        else
+          pipelined_getter.process_with_metadata(keys, req_options)
+        end
+      end
+
+      if block
+        results.each(&block)
+        # Matches get_multi/get_multi_cas: nil when a block is given, so
+        # callers can't come to depend on a return value that block-form
+        # get_multi never provided.
+        return nil
+      end
+
+      results
+    end
+
+    ##
+    # Like #get_multi_with_metadata, but wraps each entry's Hash in a
+    # Dalli::CacheResult instead. Missing keys are still omitted; no block
+    # form.
+    #
+    # Interim adapter (see #1130 / #1151): #get_multi_with_metadata itself
+    # keeps returning a Hash of Hashes, since changing that return type is a
+    # breaking change reserved for a future major version. This lets callers
+    # opt in to the structured shape today.
+    #
+    # Result key order follows #get_multi_with_metadata's own: request order
+    # only when every key lands on the same server, per-server response order
+    # otherwise.
+    #
+    # @param keys [Array<String>] the keys to fetch
+    # @param req_options [Hash, nil] see #get_multi_with_metadata
+    # @return [Hash] key => Dalli::CacheResult
+    def get_multi_with_metadata_result(*keys, req_options: nil)
+      get_multi_with_metadata(*keys, req_options: req_options).transform_values { |hash| CacheResult.new(hash) }
+    end
+
+    ##
+    # Fetch multiple keys efficiently, including available metadata such as CAS.
+    # If a block is given, yields key/data pairs one a time.  Data is an array:
+    # [value, cas_id]
+    # If no block is given, returns a hash of
+    #   { 'key' => [value, cas_id] }
+    #
+    # `req_options` accepts :p_token/:l_token, applied to every key in the batch.
+    def get_multi_cas(*keys, req_options: nil)
+      validate_routing_tokens!(req_options)
+
+      if block_given?
+        pipelined_getter.process(keys, req_options) { |*args| yield(*args) }
+      else
+        {}.tap do |hash|
+          pipelined_getter.process(keys, req_options) { |k, data| hash[k] = data }
+        end
+      end
+    end
+
+    # Fetch the value associated with the key.
+    # If a value is found, then it is returned.
+    #
+    # If a value is not found and no block is given, then nil is returned.
+    #
+    # If a value is not found (or if the found value is nil and :cache_nils is false)
+    # and a block is given, the block will be invoked and its return value
+    # written to the cache and returned.
+    def fetch(key, ttl = nil, req_options = nil)
+      req_options = req_options.nil? ? CACHE_NILS : req_options.merge(CACHE_NILS) if cache_nils
+      val = get(key, req_options)
+      return val unless block_given? && not_found?(val)
+
+      new_val = yield
+      add(key, new_val, ttl_or_default(ttl), req_options)
+      new_val
+    end
+
+    ##
+    # Fetch the value with thundering herd protection using the meta protocol's
+    # N (vivify) and R (recache) flags.
+    #
+    # This method prevents multiple clients from simultaneously regenerating the same
+    # cache entry (the "thundering herd" problem). Only one client wins the right to
+    # regenerate; other clients receive the stale value (if available) or wait.
+    #
+    # @param key [String] the cache key
+    # @param ttl [Integer] time-to-live for the cached value in seconds
+    # @param lock_ttl [Integer] how long the lock/stub lives (default: 30 seconds)
+    #   This is the maximum time other clients will return stale data while
+    #   waiting for regeneration. Should be longer than your expected regeneration time.
+    # @param recache_threshold [Integer, nil] if set, win the recache race when the
+    #   item's remaining TTL is below this threshold. Useful for proactive recaching.
+    # @param req_options [Hash] options passed to set operations (e.g., raw: true)
+    #
+    # @yield Block to regenerate the value (only called if this client won the race)
+    # @return [Object] the cached value (may be stale if another client is regenerating)
+    #
+    # @example Basic usage
+    #   client.fetch_with_lock('expensive_key', ttl: 300, lock_ttl: 30) do
+    #     expensive_database_query
+    #   end
+    #
+    # @example With proactive recaching (recache before expiry)
+    #   client.fetch_with_lock('key', ttl: 300, lock_ttl: 30, recache_threshold: 60) do
+    #     expensive_operation
+    #   end
+    #
+    def fetch_with_lock(key, ttl: nil, lock_ttl: 30, recache_threshold: nil, req_options: nil, &block)
+      raise ArgumentError, 'Block is required for fetch_with_lock' unless block_given?
+
+      # ttl is only used once the block has run; checked now so a bad one
+      # raises before the lock is taken
+      ttl_or_default(ttl)
+      validate_ttl!(:lock_ttl, lock_ttl)
+      validate_integer!(:recache_threshold, recache_threshold)
+      validate_routing_tokens!(req_options)
+      # Left unchanged for the retry below; see get_with_metadata
+      validated_key = @key_manager.validate_key(key.to_s)
+
+      server = ring.server_for_key(validated_key)
+      Instrumentation.trace('fetch_with_lock', trace_attrs('fetch_with_lock', validated_key, server)) do
+        fetch_with_lock_request(validated_key, ttl, lock_ttl, recache_threshold, req_options, &block)
+      end
+    # Only a retryable error is retried. The NetworkError raised when a server
+    # is marked down is final, as in #perform; retrying it looped forever once
+    # down_retry_delay let the same server be tried again.
+    rescue RetryableNetworkError => e
+      Dalli.logger.debug { e.inspect }
+      Dalli.logger.debug { 'retrying fetch_with_lock with new server' }
+      retry
+    end
+
+    ##
+    # compare and swap values using optimistic locking.
+    # Fetch the existing value for key.
+    # If it exists, yield the value to the block.
+    # Store the block's return value as the new value for the key.
+    # The store will fail if someone else changed the value.
+    #
+    # Returns:
+    # - nil if the key did not exist (or held nil and :cache_nils is false);
+    #   the block is not called.
+    # - false if the value was changed by someone else.
+    # - the new CAS value (a positive Integer) if the value was successfully updated.
+    def cas(key, ttl = nil, req_options = nil, &)
+      cas_core(key, false, ttl, req_options, &)
+    end
+
+    ##
+    # like #cas, but will yield to the block whether or not the value
+    # already exists. If the key did not exist, the block receives nil.
+    #
+    # Returns:
+    # - false if the value was changed by someone else, including another
+    #   client creating a missing key while the block ran.
+    # - the new CAS value (a positive Integer) if the value was successfully updated.
+    def cas!(key, ttl = nil, req_options = nil, &)
+      cas_core(key, true, ttl, req_options, &)
+    end
+
+    ##
+    # Turn on quiet aka noreply support for a number of
+    # memcached operations.
+    #
+    # All relevant operations within this block will be effectively
+    # pipelined as Dalli will use 'quiet' versions.  The invoked methods
+    # will all return nil, rather than their usual response.  Method
+    # latency will be substantially lower, as the caller will not be
+    # blocking on responses.
+    #
+    # Currently supports storage (set, add, replace, append, prepend),
+    # arithmetic (incr, decr), flush and delete operations.  Use of
+    # unsupported operations inside a block will raise an error.
+    #
+    # Any error replies will be discarded at the end of the block (or, with
+    # the defer_drain option, before the next non-quiet request), and
+    # Dalli client methods invoked inside the block will not
+    # have return values
+    #
+    # The block is quiet only for the thread or fiber that runs it. Another
+    # thread or fiber sharing this client can make requests meanwhile; a
+    # non-quiet one first sends the block's buffered requests and discards
+    # their replies, so it reads only its own.
+    def quiet
+      old = Thread.current[::Dalli::QUIET]
+      Thread.current[::Dalli::QUIET] = true
+      yield
+    ensure
+      @ring&.pipeline_consume_and_ignore_responses unless @options[:defer_drain]
+      Thread.current[::Dalli::QUIET] = old
+    end
+    alias multi quiet
+
+    ##
+    # Reads and discards the replies still pending from quiet requests, on the
+    # servers that have any. Only needed with the defer_drain option.
+    #
+    # Normally the next non-quiet request to a server drains its pending
+    # replies first. A client that only makes quiet requests (for example, a
+    # worker that only issues quiet deletes) never does, so its replies keep
+    # accumulating on the socket; call this periodically, such as after each
+    # batch or job. It sends nothing to servers with no quiet requests pending.
+    def drain_deferred_responses
+      @ring&.pipeline_consume_and_ignore_responses
+      nil
+    end
+
+    def set(key, value, ttl = nil, req_options = nil)
+      set_cas(key, value, 0, ttl, req_options)
+    end
+
+    ##
+    # Set multiple keys and values efficiently using pipelining.
+    # This method is more efficient than calling set() in a loop because
+    # it batches requests by server and uses quiet mode.
+    #
+    # A transient network error is retried automatically. If a server remains
+    # unreachable after retrying, raises Dalli::NetworkError; keys already
+    # sent to other servers before the error are not rolled back.
+    #
+    # @param hash [Hash] key-value pairs to set
+    # @param ttl [Integer] time-to-live in seconds (optional, uses default if not provided)
+    # @param req_options [Hash] options passed to each set operation; accepts
+    #   :p_token/:l_token, applied to every key in the batch
+    # @return [void]
+    # @raise [Dalli::NetworkError] if a server is unreachable after retrying
+    #
+    # Example:
+    #   client.set_multi({ 'key1' => 'value1', 'key2' => 'value2' }, 300)
+    def set_multi(hash, ttl = nil, req_options = nil)
+      return if hash.empty?
+
+      validate_routing_tokens!(req_options)
+
+      Instrumentation.trace('set_multi', multi_trace_attrs('set_multi', hash.size, hash.keys)) do
+        if ring.servers.size == 1
+          single_server_set_multi(hash, ttl_or_default(ttl), req_options)
+        else
+          pipelined_setter.process(hash, ttl_or_default(ttl), req_options)
+        end
+      end
+    end
+
+    ##
+    # Set the key-value pair, verifying existing CAS.
+    # Returns the resulting CAS value if succeeded, and falsy otherwise.
+    # The CAS must be an Integer (or a String of decimal digits) between 0 and
+    # 2**64 - 1, or nil; anything else raises ArgumentError. A CAS of 0 or nil
+    # means an unconditional set.
+    def set_cas(key, value, cas, ttl = nil, req_options = nil)
+      validate_uint64!(:cas, cas)
+      validate_routing_tokens!(req_options)
+      perform(:set, key, value, ttl_or_default(ttl), cas, req_options)
+    end
+
+    ##
+    # Conditionally add a key/value pair, if the key does not already exist
+    # on the server.  Returns truthy if the operation succeeded.
+    def add(key, value, ttl = nil, req_options = nil)
+      validate_routing_tokens!(req_options)
+      perform(:add, key, value, ttl_or_default(ttl), req_options)
+    end
+
+    ##
+    # Conditionally add a key/value pair, only if the key already exists
+    # on the server.  Returns truthy if the operation succeeded.
+    def replace(key, value, ttl = nil, req_options = nil)
+      replace_cas(key, value, 0, ttl, req_options)
+    end
+
+    ##
+    # Conditionally add a key/value pair, verifying existing CAS, only if the
+    # key already exists on the server.  Returns the new CAS value if the
+    # operation succeeded, or falsy otherwise.  The CAS is validated as in
+    # #set_cas.
+    def replace_cas(key, value, cas, ttl = nil, req_options = nil)
+      validate_uint64!(:cas, cas)
+      validate_routing_tokens!(req_options)
+      perform(:replace, key, value, ttl_or_default(ttl), cas, req_options)
+    end
+
+    # Delete a key/value pair, verifying existing CAS.
+    # Returns true if succeeded, and falsy otherwise.
+    # Delete a key, optionally with a CAS check.  The CAS is validated as in
+    # #set_cas.
+    #
+    # `req_options` accepts the same meta-delete options as #delete.
+    def delete_cas(key, cas = 0, req_options = nil)
+      validate_uint64!(:cas, cas)
+      validate_delete_options!(req_options)
+      validate_routing_tokens!(req_options)
+      perform(:delete, key, cas, req_options)
+    end
+
+    ##
+    # Delete a key.
+    #
+    # `req_options` may include the memcached meta-delete options:
+    #
+    # - `:invalidate` (Boolean) — mark the item stale instead of removing it.
+    #   This is the tombstone: readers see `stale: true` from
+    #   #get_with_metadata and #get_multi_with_metadata, and the existing value
+    #   is still readable unless `:drop_value` is also set. A tombstoned key is
+    #   *not* a miss, which lets a reader tell "another process is repopulating
+    #   this" apart from "this was never here".
+    # - `:tombstone_ttl` (Integer seconds) — how long the stale marker lives.
+    #   Requires `:invalidate`; memcached only honors the TTL on a delete when
+    #   it accompanies the invalidate flag, so passing it alone raises
+    #   ArgumentError rather than sending a request the server would treat
+    #   differently than intended. Once it elapses, reads see a miss.
+    # - `:drop_value` (Boolean) — remove the item's value but leave the item, so
+    #   a tombstone need not retain the old payload. On its own it is not a
+    #   tombstone: reads are an ordinary hit with an empty value.
+    # - `:p_token`/`:l_token` (String) — opaque routing tokens for an
+    #   intermediate proxy or router; see #get.
+    #
+    #   dc.delete('key', invalidate: true, tombstone_ttl: 30, drop_value: true)
+    #
+    # @param key [String] the key to delete
+    # @param req_options [Hash, nil] meta-delete options
+    def delete(key, req_options = nil)
+      delete_cas(key, 0, req_options)
+    end
+
+    ##
+    # Delete multiple keys efficiently using pipelining.
+    # This method is more efficient than calling delete() in a loop because
+    # it batches requests by server and uses quiet mode.
+    #
+    # `req_options` accepts the same meta-delete options as #delete and applies
+    # them to every key in the batch.
+    #
+    # @param keys [Array<String>] keys to delete
+    # @param req_options [Hash, nil] meta-delete options
+    # @return [Integer] the number of keys the server found and acted on. Only a
+    #   key that did not exist decrements this count, so with `:invalidate` it
+    #   reports how many keys were tombstoned rather than removed -- the action
+    #   is whichever one the caller asked for. This is best-effort: a transient
+    #   network error is retried automatically, and keys handled before the
+    #   error are not recounted, so the result may under-report when a retry
+    #   occurs. If a server remains unreachable after retrying, raises
+    #   Dalli::NetworkError.
+    # @raise [Dalli::NetworkError] if a server is unreachable after retrying
+    #
+    # Example:
+    #   client.delete_multi(['key1', 'key2', 'key3'])
+    #   client.delete_multi(%w[key1 key2], invalidate: true, tombstone_ttl: 30)
+    def delete_multi(keys, req_options = nil)
+      return 0 if keys.empty?
+
+      validate_delete_options!(req_options)
+      validate_routing_tokens!(req_options)
+
+      Instrumentation.trace('delete_multi', multi_trace_attrs('delete_multi', keys.size, keys)) do
+        if ring.servers.size == 1
+          single_server_delete_multi(keys, req_options)
+        else
+          pipelined_deleter.process(keys, req_options)
+        end
+      end
+    end
+
+    ##
+    # Append value to the value already stored on the server for 'key'.
+    # Appending only works for values stored with :raw => true.
+    def append(key, value, req_options = nil)
+      validate_routing_tokens!(req_options)
+      perform(:append, key, value.to_s, req_options)
+    end
+
+    ##
+    # Prepend value to the value already stored on the server for 'key'.
+    # Prepending only works for values stored with :raw => true.
+    def prepend(key, value, req_options = nil)
+      validate_routing_tokens!(req_options)
+      perform(:prepend, key, value.to_s, req_options)
+    end
+
+    ##
+    # Incr adds the given amount to the counter on the memcached server.
+    # Amt, and default if given, must be Integers (or Strings of decimal
+    # digits) between 0 and 2**64 - 1; anything else raises ArgumentError.
+    #
+    # If default is nil, the counter must already exist or the operation
+    # will fail and will return nil.  Otherwise this method will return
+    # the new value for the counter.
+    #
+    # Note that the ttl will only apply if the counter does not already
+    # exist.  To increase an existing counter and update its TTL, use
+    # #cas.
+    #
+    # If the value already exists, it must have been set with raw: true
+    def incr(key, amt = 1, ttl = nil, default = nil, req_options = nil)
+      amt = validate_uint64!(:amt, amt)
+      default = validate_uint64!(:default, default)
+      validate_routing_tokens!(req_options)
+
+      perform(:incr, key, amt, ttl_or_default(ttl), default, req_options)
+    end
+
+    ##
+    # Decr subtracts the given amount from the counter on the memcached server.
+    # Amt, and default if given, must be Integers (or Strings of decimal
+    # digits) between 0 and 2**64 - 1; anything else raises ArgumentError.
+    #
+    # memcached counters are unsigned and cannot hold negative values.  Calling
+    # decr on a counter which is 0 will just return 0.
+    #
+    # If default is nil, the counter must already exist or the operation
+    # will fail and will return nil.  Otherwise this method will return
+    # the new value for the counter.
+    #
+    # Note that the ttl will only apply if the counter does not already
+    # exist.  To decrease an existing counter and update its TTL, use
+    # #cas.
+    #
+    # If the value already exists, it must have been set with raw: true
+    def decr(key, amt = 1, ttl = nil, default = nil, req_options = nil)
+      amt = validate_uint64!(:amt, amt)
+      default = validate_uint64!(:default, default)
+      validate_routing_tokens!(req_options)
+
+      perform(:decr, key, amt, ttl_or_default(ttl), default, req_options)
+    end
+
+    ##
+    # Flush the memcached server, at 'delay' seconds in the future.
+    # Delay defaults to zero seconds, which means an immediate flush.
+    # Delay must be a non-negative Integer (or a String of decimal digits);
+    # anything else raises ArgumentError.
+    # Every server is attempted. If any of them fails, the first error is
+    # raised once all the others have been flushed.
+    ##
+    def flush(delay = 0)
+      validate_uint64!(:delay, delay)
+      first_error = nil
+      results = ring.servers.map do |s|
+        s.request(:flush, delay)
+      rescue StandardError => e
+        first_error ||= e
+        nil
+      end
+      raise first_error if first_error
+
+      results
+    end
+    alias flush_all flush
+
+    ALLOWED_STAT_KEYS = %i[items slabs settings].freeze
+
+    ##
+    # Collect the stats for each server.
+    # You can optionally pass a type including :items, :slabs or :settings to get specific stats
+    # Returns a hash like { 'hostname:port' => { 'stat1' => 'value1', ... }, 'hostname2:port' => { ... } }
+    def stats(type = nil)
+      type = nil unless ALLOWED_STAT_KEYS.include? type
+      values = {}
+      ring.servers.each do |server|
+        values[server.name.to_s] = server.alive? ? server.request(:stats, type.to_s) : nil
+      end
+      values
+    end
+
+    ##
+    # Reset stats for each server.
+    def reset_stats
+      ring.servers.map do |server|
+        server.alive? ? server.request(:reset_stats) : nil
+      end
+    end
+
+    ##
+    ## Version of the memcache servers.
+    def version
+      values = {}
+      ring.servers.each do |server|
+        values[server.name.to_s] = server.alive? ? server.request(:version) : nil
+      end
+      values
+    end
+
+    ##
+    ## Make sure memcache servers are alive, or raise an Dalli::RingError
+    def alive!
+      ring.server_for_key('')
+    end
+
+    ##
+    # Close our connection to each server.
+    # If you perform another operation after this, the connections will be re-established.
+    def close
+      @ring&.close
+      @ring = nil
+    end
+    alias reset close
+
+    CACHE_NILS = { cache_nils: true }.freeze
+    EMPTY_ATTRIBUTES = {}.freeze
+
+    def not_found?(val)
+      cache_nils ? val == ::Dalli::NOT_FOUND : val.nil?
+    end
+
+    def cache_nils
+      @options[:cache_nils]
+    end
+
+    # Stub method so a bare Dalli client can pretend to be a connection pool.
+    def with
+      yield self
+    end
+
+    private
+
+    # Raised before the request reaches a server: RequestFormatter enforces the
+    # same rule, but reaching it means unwinding through Protocol::Base#request,
+    # which logs the failure as unexpected and closes the connection.  A caller
+    # passing the wrong options should get a clean ArgumentError and keep its
+    # connection.
+    def validate_delete_options!(req_options)
+      return unless req_options.is_a?(Hash)
+
+      tombstone_ttl = req_options[:tombstone_ttl]
+      return unless tombstone_ttl
+
+      raise ArgumentError, 'tombstone_ttl requires invalidate: true' unless req_options[:invalidate]
+
+      # tombstone_kwargs coerces this with Integer(), deep inside the request
+      # path; validated here first so a bad value raises cleanly instead of
+      # unwinding through Protocol::Base#request, which would close the
+      # connection on the ArgumentError Integer() raises.
+      begin
+        tombstone_ttl = Integer(tombstone_ttl)
+      rescue ArgumentError, TypeError
+        raise ArgumentError, "tombstone_ttl must be an integer, got #{tombstone_ttl.inspect}"
+      end
+      validate_ttl!(:tombstone_ttl, tombstone_ttl)
+    end
+
+    def record_hit_miss_metrics(span, key_count, hit_count)
+      return unless span
+
+      span.add_attributes('db.memcached.hit_count' => hit_count,
+                          'db.memcached.miss_count' => key_count - hit_count)
+    end
+
+    def get_multi_yielding(keys, req_options = nil)
+      Instrumentation.trace_with_result('get_multi', get_multi_attributes(keys)) do |span|
+        hit_count = 0
+        pipelined_getter.process(keys, req_options, return_cas: false) do |k, data|
+          hit_count += 1
+          yield k, data.first
+        end
+        record_hit_miss_metrics(span, keys.size, hit_count)
+        nil
+      end
+    end
+
+    def get_multi_hash(keys, req_options = nil)
+      Instrumentation.trace_with_result('get_multi', get_multi_attributes(keys)) do |span|
+        hash = if ring.servers.size == 1
+                 single_server_get_multi(keys, req_options)
+               else
+                 {}.tap do |h|
+                   pipelined_getter.process(keys, req_options, return_cas: false) { |k, data| h[k] = data.first }
+                 end
+               end
+        record_hit_miss_metrics(span, keys.size, hash.size)
+        hash
+      end
+    end
+
+    def single_server
+      server = ring.servers.first
+      server if server&.alive?
+    end
+
+    # The three single_server_* fast-path methods below share one contract,
+    # matching the pipelined multi-server path they stand in for: a transient
+    # RetryableNetworkError is retried (bounded implicitly by the server's own
+    # socket_max_failures, same as the pipelined path's retry), and a hard
+    # NetworkError -- the server genuinely unreachable, not just blipping --
+    # propagates to the caller rather than being swallowed into a silently
+    # wrong result. Only server_for_key/single_server finding no live server
+    # to route to at all is still silent, matching Ring#keys_grouped_by_server
+    # dropping a key it can't route on both the single- and multi-server paths.
+    def single_server_get_multi(keys, req_options = nil)
+      caller_keys = @key_manager.caller_keys_by_wire_key(keys)
+      return {} unless (server = single_server)
+
+      results_for_caller_keys(server.request(:read_multi_req, caller_keys.keys, req_options), caller_keys)
+    rescue Dalli::RetryableNetworkError => e
+      Dalli.logger.debug { e.inspect }
+      Dalli.logger.debug { 'retrying single-server get_multi because of network error' }
+      retry
+    rescue Dalli::UnexpectedReplyKeyError => e
+      # The connection is closed and the keys are treated as missing, as the
+      # pipelined get_multi does for a server whose replies are out of step
+      Dalli.logger.warn { e.message }
+      {}
+    end
+
+    def single_server_get_multi_with_metadata(keys, req_options = nil)
+      caller_keys = @key_manager.caller_keys_by_wire_key(keys)
+      return {} unless (server = single_server)
+
+      results_for_caller_keys(server.request(:read_multi_with_metadata_req, caller_keys.keys, req_options),
+                              caller_keys)
+    rescue Dalli::RetryableNetworkError => e
+      Dalli.logger.debug { e.inspect }
+      Dalli.logger.debug { 'retrying single-server get_multi_with_metadata because of network error' }
+      retry
+    rescue Dalli::UnexpectedReplyKeyError => e
+      Dalli.logger.warn { e.message }
+      {}
+    end
+
+    # Replies name the key as sent; returns them under the caller's keys,
+    # skipping any key that wasn't requested
+    def results_for_caller_keys(results, caller_keys)
+      results.each_with_object({}) do |(key, value), hash|
+        caller_key = @key_manager.caller_key(caller_keys, key)
+        hash[caller_key] = value if caller_key
+      end
+    end
+
+    def single_server_set_multi(hash, ttl, req_options)
+      pairs = hash.transform_keys { |k| @key_manager.validate_key(k.to_s) }
+      return unless (server = single_server)
+
+      server.request(:write_multi_req, pairs, ttl, req_options)
+    rescue Dalli::RetryableNetworkError => e
+      Dalli.logger.debug { e.inspect }
+      Dalli.logger.debug { 'retrying single-server set_multi because of network error' }
+      retry
+    end
+
+    def single_server_delete_multi(keys, req_options = nil)
+      validated_keys = keys.map { |k| @key_manager.validate_key(k.to_s) }
+      return 0 unless (server = single_server)
+
+      server.request(:delete_multi_req, validated_keys, req_options)
+    rescue Dalli::RetryableNetworkError => e
+      Dalli.logger.debug { e.inspect }
+      Dalli.logger.debug { 'retrying single-server delete_multi because of network error' }
+      retry
+    end
+
+    # Only built when tracing is on, since the Hash is thrown away otherwise
+    def get_multi_attributes(keys)
+      Instrumentation.enabled? ? multi_trace_attrs('get_multi', keys.size, keys) : EMPTY_ATTRIBUTES
+    end
+
+    def trace_attrs(operation, key, server)
+      attrs = { 'db.operation.name' => operation, 'server.address' => server.hostname }
+      attrs['server.port'] = server.port if server.socket_type == :tcp
+      attrs['peer.service'] = @options[:otel_peer_service] if @options[:otel_peer_service]
+      add_query_text(attrs, operation, key)
+    end
+
+    def multi_trace_attrs(operation, key_count, keys)
+      attrs = { 'db.operation.name' => operation, 'db.memcached.key_count' => key_count }
+      attrs['peer.service'] = @options[:otel_peer_service] if @options[:otel_peer_service]
+      add_query_text(attrs, operation, keys)
+    end
+
+    def add_query_text(attrs, operation, key_or_keys)
+      case @options[:otel_db_statement]
+      when :include
+        attrs['db.query.text'] = "#{operation} #{Array(key_or_keys).join(' ')}"
+      when :obfuscate
+        attrs['db.query.text'] = "#{operation} ?"
+      end
+      attrs
+    end
+
+    # Numeric arguments that become meta protocol flags (GHSA-6wmv-xq9m-fmp7).
+    # RequestFormatter converts them to Integer as the wire-level backstop;
+    # checking here too gives the caller a clean ArgumentError for the same
+    # reason as routing tokens, described below.
+    def validate_integer!(name, value)
+      return if value.nil?
+
+      value.is_a?(String) ? Integer(value, 10) : Integer(value)
+    rescue ArgumentError, TypeError, FloatDomainError
+      raise ArgumentError, "#{name} must be an Integer, got #{value.inspect}"
+    end
+
+    MAX_UINT64 = (2**64) - 1
+    private_constant :MAX_UINT64
+
+    # CAS values, incr/decr amounts and initial values, and the flush delay
+    # are read by memcached as unsigned 64-bit integers. RequestFormatter
+    # raises on anything else as the wire-level backstop; checking here first
+    # keeps the connection open, for the reason given for routing tokens
+    # below. Accepts an Integer or a String of decimal digits, and returns it
+    # as an Integer.
+    def validate_uint64!(name, value)
+      return if value.nil?
+
+      int = case value
+            when Integer then value
+            when String then Integer(value, 10, exception: false)
+            end
+      return int if int && int >= 0 && int <= MAX_UINT64
+
+      raise ArgumentError, "#{name} must be an Integer between 0 and #{MAX_UINT64}, got #{value.inspect}"
+    end
+
+    # Validated here, before the request reaches Protocol::Base#request, rather
+    # than only at the RequestFormatter level. Reaching only the formatter's
+    # check means unwinding through Protocol::Base#request, which logs the
+    # failure as unexpected and closes the connection -- a caller passing a
+    # bad token should get a clean ArgumentError and keep its connection.
+    ROUTING_TOKEN_FORBIDDEN = /[\x00-\x20\x7F]/
+    private_constant :ROUTING_TOKEN_FORBIDDEN
+
+    def validate_routing_tokens!(req_options)
+      return unless req_options.is_a?(Hash)
+
+      validate_routing_token!(:p_token, req_options[:p_token])
+      validate_routing_token!(:l_token, req_options[:l_token])
+    end
+
+    def validate_routing_token!(name, value)
+      # Only an empty *String* is a no-op; see the matching comment in
+      # RequestFormatter#routing_tokens for why respond_to?(:empty?) is wrong
+      # here (it would also excuse [] / {} from the type check below).
+      return if value.nil? || (value.is_a?(String) && value.empty?)
+      raise ArgumentError, "#{name} must be a String, got #{value.class}" unless value.is_a?(String)
+      return unless value.match?(ROUTING_TOKEN_FORBIDDEN)
+
+      raise ArgumentError, "#{name} must not contain whitespace or control characters"
+    end
+
+    def cas_core(key, always_set, ttl = nil, req_options = nil)
+      validate_routing_tokens!(req_options)
+      (value, cas) = perform(:cas, key, req_options)
+      return if !always_set && cas_miss?(value, cas)
+
+      newvalue = yield(value)
+      # A CAS of 0 means the key was missing. A set with CAS 0 is unconditional,
+      # so add instead: it fails if another client created the key meanwhile.
+      return perform(:add, key, newvalue, ttl_or_default(ttl), req_options) if cas.zero?
+
+      perform(:set, key, newvalue, ttl_or_default(ttl), cas, req_options)
+    end
+
+    # The CAS lookup returns [nil, 0] on a miss rather than NOT_FOUND, and a
+    # stored item always has a non-zero CAS. So under cache_nils a zero CAS
+    # marks the miss, and a stored nil is a hit, as in #not_found?.
+    def cas_miss?(value, cas)
+      cache_nils ? cas.zero? : value.nil?
+    end
+
+    def fetch_with_lock_request(key, ttl, lock_ttl, recache_threshold, req_options)
+      server = ring.server_for_key(key)
+      # req_options is the base, not the override: fetch_with_lock's own
+      # lock_ttl/recache_threshold parameters must always win, even if a
+      # caller's req_options happened to contain :vivify_ttl/:recache_ttl.
+      meta_options = req_options.is_a?(Hash) ? req_options.dup : {}
+      meta_options[:vivify_ttl] = lock_ttl
+      meta_options[:recache_ttl] = recache_threshold
+      result = server.request(:meta_get, key, meta_options)
+
+      return result[:value] unless result[:won_recache]
+
+      new_val = yield
+      set(key, new_val, ttl_or_default(ttl), req_options)
+      new_val
+    end
+
+    ##
+    # Uses the argument TTL or the client-wide default.  Ensures
+    # that the value is an integer memcached accepts as an expiration
+    ##
+    def ttl_or_default(ttl)
+      validate_ttl!(:ttl, ttl || @options[:expires_in] || 0)
+    end
+
+    # Returns the TTL as an Integer, raising ArgumentError unless memcached
+    # can use it. A String must be a whole number in decimal, as for the other
+    # numeric arguments; anything else is converted with to_i, so a Float or
+    # an ActiveSupport::Duration still works. Once sanitized (see
+    # TtlSanitizer) it must fit memcached's signed 32-bit expiration time. A
+    # negative TTL is allowed: memcached stores the item as already expired.
+    # memcached rejects a TTL outside that with CLIENT_ERROR, which a quiet
+    # block or set_multi silently discards, so it is checked here, before the
+    # request is written.
+    def validate_ttl!(name, value)
+      return if value.nil?
+      # The usual case: an Integer TTL that TtlSanitizer leaves unchanged
+      return value if value.is_a?(Integer) && value >= Protocol::TtlSanitizer::MIN_EXPIRATION_TIME &&
+                      value <= Protocol::TtlSanitizer::MAX_ACCEPTABLE_EXPIRATION_INTERVAL
+
+      ttl = ttl_to_i(name, value)
+      min = Protocol::TtlSanitizer::MIN_EXPIRATION_TIME
+      max = Protocol::TtlSanitizer::MAX_EXPIRATION_TIME
+      return ttl if Protocol::TtlSanitizer.sanitize(ttl).between?(min, max)
+
+      raise ArgumentError, "#{name} must be a number of seconds no smaller than #{min} or a Unix time " \
+                           "no later than #{max}, got #{value.inspect}"
+    end
+
+    def ttl_to_i(name, value)
+      value.is_a?(String) ? Integer(value, 10) : value.to_i
+    rescue ArgumentError, NoMethodError, FloatDomainError
+      raise ArgumentError, "#{name} must be an Integer, got #{value.inspect}"
+    end
+
+    def ring
+      @ring ||= Dalli::Ring.new(@normalized_servers, @options)
+    end
+
+    ##
+    # Chokepoint method for memcached methods with a key argument.
+    # Validates the key, resolves the key to the appropriate server
+    # instance, and invokes the memcached method on the appropriate
+    # server.
+    #
+    # This method also forces retries on network errors - when
+    # a particular memcached instance becomes unreachable, or the
+    # operation times out. Once some of the request has been sent, only
+    # one that is safe to apply twice is retried; for the others
+    # (incr, decr, append, prepend, add, replace and CAS writes)
+    # Protocol::Base#request raises a NetworkError, which isn't retried.
+    ##
+    # rubocop:disable Naming/MethodParameterName
+    def perform(op, key, ...)
+      # rubocop:enable Naming/MethodParameterName
+      return yield if block_given?
+
+      # `retry` below re-runs this method with its original arguments, so `key`
+      # must stay as the caller gave it: reassigning it would apply the
+      # namespace a second time and send the retry to a different key.
+      validated_key = @key_manager.validate_key(key.to_s)
+
+      server = ring.server_for_key(validated_key)
+
+      if Instrumentation.enabled?
+        op_name = op.name
+        Instrumentation.trace(op_name, trace_attrs(op_name, validated_key, server)) do
+          server.request(op, validated_key, ...)
+        end
+      else
+        server.request(op, validated_key, ...)
+      end
+    rescue RetryableNetworkError => e
+      Dalli.logger.debug { e.inspect }
+      Dalli.logger.debug { 'retrying request with new server' }
+      retry
+    end
+
+    # Works on a copy so the caller's hash is neither modified here nor able
+    # to change this client's configuration later.
+    def normalize_options(options)
+      opts = options.dup
+      opts[:expires_in] = ttl_to_i(:expires_in, opts[:expires_in]) if opts[:expires_in]
+      opts
+    end
+
+    REMOVED_OPTIONS = {
+      protocol: 'Dalli 5.0 only supports the meta protocol. The :protocol option has been removed.',
+      username: 'Dalli 5.0 removed SASL authentication support. The :username option is ignored.',
+      password: 'Dalli 5.0 removed SASL authentication support. The :password option is ignored.'
+    }.freeze
+    private_constant :REMOVED_OPTIONS
+
+    def warn_removed_options(opts)
+      REMOVED_OPTIONS.each do |key, message|
+        next unless opts.key?(key)
+
+        Dalli.logger.warn(message)
+      end
+    end
+
+    def pipelined_getter
+      PipelinedGetter.new(ring, @key_manager)
+    end
+
+    def pipelined_setter
+      PipelinedSetter.new(ring, @key_manager)
+    end
+
+    def pipelined_deleter
+      PipelinedDeleter.new(ring, @key_manager)
+    end
+  end
+end

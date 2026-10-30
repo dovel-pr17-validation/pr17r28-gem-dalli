@@ -1,0 +1,57 @@
+name: Profiles
+
+# Pushes to other branches are covered by their pull request's run, so a PR
+# branch isn't tested twice
+on:
+  push:
+    branches: [main, '*-stable']
+  pull_request:
+
+concurrency:
+  group: profiles-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Install Memcached 1.6.45
+      working-directory: scripts
+      env:
+        MEMCACHED_VERSION: 1.6.45
+      run: |
+        chmod +x ./install_memcached.sh
+        ./install_memcached.sh
+        memcached -d
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+      with:
+        ruby-version: 3.4
+        bundler-cache: true # 'bundle install' and cache
+    - name: Run Profiles
+      run: RUBY_YJIT_ENABLE=1 BENCH_TARGET=all bundle exec bin/profile
+    # NOTE: to pull profile results, visit https://github.com/petergoldstein/dalli/actions/workflows/profile.yml
+    # click to view the run you are interested in (ex https://github.com/petergoldstein/dalli/actions/runs/13296952241)
+    # in the artifacts section, download the profile results
+    - name: Upload profile results
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: profile-results
+        path: |
+          client_get_profile.json
+          socket_get_profile.json
+          client_set_profile.json
+          socket_set_profile.json
+          client_get_multi_profile.json
+          socket_get_multi_profile.json
+          client_set_multi_profile.json
+          socket_set_multi_profile.json
+          meta_client_get_multi_profile.json
+          meta_client_get_profile.json
+          meta_client_set_multi_profile.json
+          meta_client_set_profile.json

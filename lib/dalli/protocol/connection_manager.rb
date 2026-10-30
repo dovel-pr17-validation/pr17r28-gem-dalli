@@ -1,0 +1,433 @@
+# frozen_string_literal: true
+
+require 'English'
+require 'socket'
+require 'timeout'
+
+module Dalli
+  module Protocol
+    ##
+    # Manages the socket connection to the server, including ensuring liveness
+    # and retries.
+    ##
+    class ConnectionManager
+      DEFAULTS = {
+        # seconds between trying to contact a remote server
+        down_retry_delay: 30,
+        # connect/read/write timeout for socket operations
+        socket_timeout: 1,
+        # times a socket operation may fail before considering the server dead
+        socket_max_failures: 2,
+        # amount of time to sleep between retries when a failure occurs
+        socket_failure_delay: 0.1,
+        # Set keepalive
+        keepalive: true
+      }.freeze
+
+      attr_accessor :hostname, :port, :socket_type, :options
+      attr_reader :sock
+      # The buffer replies are read into (see Base#response_buffer). It's
+      # cleared with the write buffer whenever the connection closes.
+      attr_writer :response_buffer
+
+      def initialize(hostname, port, socket_type, client_options)
+        @hostname = hostname
+        @port = port
+        @socket_type = socket_type
+        @options = DEFAULTS.merge(client_options)
+        @request_in_progress = false
+        @request_sent = false
+        @quiet_responses_pending = false
+        @sock = nil
+        @pid = nil
+        @write_buffer = []
+        @write_buffer_bytes = 0
+        @response_buffer = nil
+
+        @fail_count = 0
+        reset_down_info
+      end
+
+      def name
+        if socket_type == :unix
+          hostname
+        else
+          "#{hostname}:#{port}"
+        end
+      end
+
+      def establish_connection
+        Dalli.logger.debug { "Dalli::Server#connect #{name}" }
+
+        @sock = memcached_socket
+        # Writes are buffered in @write_buffer instead; see WRITE_BUFFER_FLUSH_BYTES
+        @sock.sync = true
+        @pid = Process.pid
+        @request_in_progress = false
+        @quiet_responses_pending = false
+      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError, SocketError => e
+        # SocketError = DNS resolution failure; SSL_ERRORS = failed TLS handshake
+        error_on_request!(e)
+      end
+
+      def reconnect_down_server?
+        return true unless @last_down_at
+
+        time_to_next_reconnect = @last_down_at + options[:down_retry_delay] - Time.now
+        return true unless time_to_next_reconnect.positive?
+
+        Dalli.logger.debug do
+          format('down_retry_delay not reached for %<name>s (%<time>.3f seconds left)', name: name,
+                                                                                        time: time_to_next_reconnect)
+        end
+        false
+      end
+
+      def up!
+        log_up_detected
+        reset_down_info
+      end
+
+      # Marks the server instance as down.  Updates the down_at state
+      # and raises an Dalli::NetworkError that includes the underlying
+      # error in the message.  Calls close to clean up socket state
+      def down!
+        close
+        log_down_detected
+        # Once down_retry_delay passes, the server gets a full set of attempts
+        @fail_count = 0
+
+        @error = $ERROR_INFO&.class&.name
+        @msg ||= $ERROR_INFO&.message
+        raise_down_error
+      end
+
+      def raise_down_error
+        raise Dalli::NetworkError, "#{name} is down: #{@error} #{@msg}"
+      end
+
+      def socket_timeout
+        @socket_timeout ||= @options[:socket_timeout]
+      end
+
+      def confirm_ready!
+        close if request_in_progress?
+        reconnect_on_fork if fork_detected?
+      end
+
+      def confirm_in_progress!
+        raise '[Dalli] No request in progress. This may be a bug in Dalli.' unless request_in_progress?
+
+        reconnect_on_fork if fork_detected?
+      end
+
+      def close
+        return unless @sock
+
+        begin
+          close_socket
+        rescue StandardError
+          nil
+        ensure
+          # A non-StandardError (e.g. a second Async::Stop fired into the
+          # fiber while it is already inside this cleanup) can escape
+          # @sock.close; run the state cleanup unconditionally so the client
+          # isn't returned to the pool with a half-closed socket and
+          # @request_in_progress == true.
+          @sock = nil
+          @pid = nil
+          @quiet_responses_pending = false
+          discard_write_buffer
+          @response_buffer&.clear
+          abort_request!
+        end
+      end
+
+      # A forked child shares the parent's connection, so it closes only its
+      # own file descriptor. Closing the TLS socket itself would send
+      # close_notify and end the parent's TLS session.
+      def close_socket
+        fork_detected? ? @sock.to_io.close : @sock.close
+      end
+
+      def connected?
+        !@sock.nil?
+      end
+
+      # True when a quiet request was written on this connection and its
+      # replies (memcached only suppresses some of them) haven't been
+      # consumed by a noop yet.
+      def quiet_responses_pending?
+        @quiet_responses_pending
+      end
+
+      def mark_quiet_responses_pending!
+        @quiet_responses_pending = true
+      end
+
+      def clear_quiet_responses_pending!
+        @quiet_responses_pending = false
+      end
+
+      def request_in_progress?
+        @request_in_progress
+      end
+
+      def start_request!
+        raise '[Dalli] Request already in progress. This may be a bug in Dalli.' if @request_in_progress
+
+        @request_in_progress = true
+        @request_sent = false
+      end
+
+      def finish_request!
+        raise '[Dalli] No request in progress. This may be a bug in Dalli.' unless @request_in_progress
+
+        @request_in_progress = false
+        @request_sent = false
+        # A completed request is what proves the server healthy again, so the
+        # failure count resets here rather than on reconnect: a server that
+        # accepts connections but never answers would otherwise reset it on
+        # every retry and never reach socket_max_failures.
+        @fail_count = 0
+      end
+
+      def abort_request!
+        @request_in_progress = false
+        @request_sent = false
+      end
+
+      # True once any of the request in progress has been handed to the
+      # socket. Writes made outside a request (the version check on connect,
+      # draining an earlier quiet block's replies) don't count.
+      def request_sent?
+        @request_sent
+      end
+
+      # The longest reply line Dalli reads, in bytes, CRLF included. A meta
+      # reply header is at most about 500 bytes: "VA <size>" plus its flags,
+      # the largest being a 250-byte key base64-encoded to 336 bytes, a
+      # 20-digit CAS, a 32-byte opaque and a few numeric fields. The longest
+      # stats line (stats settings) carries a file path such as ext_path, up
+      # to PATH_MAX (4096). 8 KiB leaves room for both, while a server that
+      # never sends CRLF can't grow the read buffer without bound.
+      MAX_LINE_BYTES = 8 * 1024
+
+      def read_line
+        flush_write_buffer
+        data = @sock.gets("\r\n", MAX_LINE_BYTES)
+        error_on_request!('EOF in read_line') if data.nil?
+        # Without its CRLF the line either ran past MAX_LINE_BYTES or was cut
+        # short by EOF; either way the connection is out of step
+        error_on_request!("Reply line without CRLF in the first #{MAX_LINE_BYTES} bytes") unless data.end_with?("\r\n")
+        data
+      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
+        error_on_request!(e)
+      end
+
+      # JRuby doesn't support IO#timeout=, so use custom readfull implementation
+      # CRuby 3.3+ has IO#timeout= which makes IO#read work with timeouts
+      # memcached can't store an item larger than 1 GiB (its -I maximum), so a
+      # reply claiming more (or a negative size) is malformed or hostile.
+      # IO#read allocates the full count up front, so check before reading.
+      MAX_READ_BYTES = (1024 * 1024 * 1024) + 2 # plus the value's trailing "\r\n"
+
+      def check_read_size!(count)
+        return if count.between?(0, MAX_READ_BYTES)
+
+        raise Dalli::DalliError, "Reply size #{count} from #{name} is out of range"
+      end
+
+      if RUBY_ENGINE == 'jruby'
+        def read(count)
+          check_read_size!(count)
+          flush_write_buffer
+          @sock.readfull(count)
+        rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
+          error_on_request!(e)
+        end
+      else
+        def read(count)
+          check_read_size!(count)
+          flush_write_buffer
+          read_bytes(count)
+        rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
+          error_on_request!(e)
+        end
+      end
+
+      # Alias for callers that want to make the exact-length contract explicit
+      # at the call site.
+      alias read_exact read
+
+      # Requests are buffered here rather than in the socket's own IO buffer
+      # (the socket is sync). Ruby flushes an IO's write buffer when any process
+      # holding it closes or finalizes the IO, so after a fork a child could
+      # send bytes the parent had buffered but not sent yet: a quiet write would
+      # run twice, or the parent's replies would shift onto the wrong requests.
+      # A forked child discards this buffer instead. Like IO's own buffer, it
+      # is sent once it grows past this size, or when a reply is read.
+      WRITE_BUFFER_FLUSH_BYTES = 64 * 1024
+
+      def write(bytes)
+        @write_buffer << bytes
+        @write_buffer_bytes += bytes.bytesize
+        flush_write_buffer if @write_buffer_bytes >= WRITE_BUFFER_FLUSH_BYTES
+        bytes.bytesize
+      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, IOError => e
+        error_on_request!(e)
+      end
+
+      def flush
+        flush_write_buffer
+      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, IOError => e
+        error_on_request!(e)
+      end
+
+      def flushed_write(bytes)
+        @write_buffer << bytes
+        flush_write_buffer
+        bytes.bytesize
+      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, IOError => e
+        error_on_request!(e)
+      end
+
+      # Non-blocking read.  Here to support the operation
+      # of the get_multi operation
+      def read_available(...)
+        flush_write_buffer
+        @sock.read_available(...)
+      end
+
+      def max_allowed_failures
+        @max_allowed_failures ||= @options[:socket_max_failures] || 2
+      end
+
+      def error_on_request!(err_or_string)
+        log_warn_message(err_or_string)
+
+        @fail_count += 1
+        if @fail_count >= max_allowed_failures
+          down!
+        else
+          # Closes the existing socket, setting up for a reconnect
+          # on next request
+          reconnect!('Socket operation failed, retrying...')
+        end
+      end
+
+      def reconnect!(message)
+        # Read before close, which ends the request
+        request_sent = @request_sent
+        close
+        sleep(options[:socket_failure_delay]) if options[:socket_failure_delay]
+        raise Dalli::RetryableNetworkError.new(message, request_sent: request_sent)
+      end
+
+      # Called on connect. Deliberately leaves @fail_count alone; see
+      # finish_request!.
+      def reset_down_info
+        @down_at = nil
+        @last_down_at = nil
+        @msg = nil
+        @error = nil
+      end
+
+      def memcached_socket
+        if socket_type == :unix
+          Dalli::Socket::UNIX.open(hostname, options)
+        else
+          Dalli::Socket::TCP.open(hostname, port, options)
+        end
+      end
+
+      def log_warn_message(err_or_string)
+        Dalli.logger.warn do
+          detail = err_or_string.is_a?(String) ? err_or_string : "#{err_or_string.class}: #{err_or_string.message}"
+          "#{name} failed (count: #{@fail_count}) #{detail}"
+        end
+      end
+
+      def reconnect_on_fork
+        message = 'Fork detected, re-connecting child process...'
+        Dalli.logger.info { message }
+        # Drops anything the parent had buffered, closes the inherited socket
+        # without touching the parent's connection, and reconnects immediately
+        close
+        establish_connection
+      end
+
+      def fork_detected?
+        @pid && @pid != Process.pid
+      end
+
+      def log_down_detected
+        @last_down_at = Time.now
+
+        if @down_at
+          time = Time.now - @down_at
+          Dalli.logger.debug { format('%<name>s is still down (for %<time>.3f seconds now)', name: name, time: time) }
+        else
+          @down_at = @last_down_at
+          Dalli.logger.warn("#{name} is down")
+        end
+      end
+
+      def log_up_detected
+        return unless @down_at
+
+        time = Time.now - @down_at
+        Dalli.logger.warn { format('%<name>s is back (downtime was %<time>.3f seconds)', name: name, time: time) }
+      end
+
+      private
+
+      # One write per flush. A TLS socket sends each argument of
+      # write(*parts) as its own record and system call, so the parts are
+      # joined first.
+      def flush_write_buffer
+        return if @write_buffer.empty?
+
+        # Set before writing: a write that fails may still have sent some bytes
+        @request_sent = true if @request_in_progress
+        @sock.write(@write_buffer.size == 1 ? @write_buffer.first : joined_write_buffer)
+        discard_write_buffer
+      end
+
+      # Joined as bytes: requests can mix UTF-8 and binary strings, which
+      # String#<< refuses to combine when both hold non-ASCII bytes
+      if String.method_defined?(:append_as_bytes)
+        def joined_write_buffer
+          out = String.new(capacity: @write_buffer_bytes, encoding: Encoding::BINARY)
+          @write_buffer.each { |part| out.append_as_bytes(part) }
+          out
+        end
+      else
+        def joined_write_buffer
+          out = String.new(capacity: @write_buffer_bytes, encoding: Encoding::BINARY)
+          @write_buffer.each { |part| out << part.b }
+          out
+        end
+      end
+
+      def discard_write_buffer
+        @write_buffer.clear
+        @write_buffer_bytes = 0
+      end
+
+      # Reads exactly `count` bytes. IO#read(count) on a blocking socket blocks
+      # until it has `count` bytes, accumulating across TCP chunks internally,
+      # and only hands back a shorter (or nil) buffer when the stream hits EOF.
+      # So a short read means the peer closed mid-response: raise EOFError and
+      # let read's existing `rescue EOFError` route it through
+      # error_on_request!, which closes the dirty socket for a retry on a fresh
+      # connection (and preserves the $ERROR_INFO context down! relies on).
+      def read_bytes(count)
+        buffer = @sock.read(count)
+        return buffer if buffer && buffer.bytesize == count
+
+        raise EOFError, "EOF reading #{count} bytes; received #{buffer ? buffer.bytesize : 0}"
+      end
+    end
+  end
+end

@@ -1,0 +1,33 @@
+inherit_from: .rubocop_todo.yml
+
+plugins:
+  - rubocop-minitest
+  - rubocop-performance
+  - rubocop-rake
+  - rubocop-thread_safety
+
+ThreadSafety:
+  Enabled: true
+  Exclude:
+    - "**/*.gemspec"
+    - test/**/*
+
+AllCops:
+  NewCops: enable
+  TargetRubyVersion: 3.3
+  Exclude:
+    - 'bin/benchmark_*'
+    - 'vendor/**/*'
+
+Metrics:
+  Enabled: false
+
+Style/Documentation:
+  Exclude:
+    - 'test/**/*'
+
+Naming/PredicateMethod:
+  Enabled: false
+
+Naming/PredicatePrefix:
+  Enabled: false

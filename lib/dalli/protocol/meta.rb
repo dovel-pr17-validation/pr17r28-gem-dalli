@@ -1,0 +1,476 @@
+# frozen_string_literal: true
+
+require 'forwardable'
+require 'socket'
+require 'timeout'
+
+module Dalli
+  module Protocol
+    ##
+    # Access point for a single Memcached server, accessed via Memcached's meta
+    # protocol.  Contains logic for managing connection state to the server (retries, etc),
+    # formatting requests to the server, and unpacking responses.
+    ##
+    class Meta < Base
+      TERMINATOR = "\r\n"
+
+      def response_processor
+        @response_processor ||= ResponseProcessor.new(@connection_manager, @value_marshaller)
+      end
+
+      # NOTE: Additional public methods should be overridden in Dalli::Threadsafe
+
+      private
+
+      # Retrieval Commands
+      def get(key, options = nil)
+        # Fast path for the common case of no per-request options (nil or false)
+        unless options
+          flushed_write(RequestFormatter.plain_meta_get(key, raw_mode?))
+          return response_processor.meta_get_with_value
+        end
+
+        # Skip bitflags in raw mode - saves 2 bytes per request and skips parsing
+        skip_flags = raw_mode? || options[:raw]
+        req = if routing_tokens?(options)
+                RequestFormatter.meta_get(key: key, skip_flags: skip_flags, **routing_token_kwargs(options))
+              else
+                RequestFormatter.plain_meta_get(key, skip_flags)
+              end
+        flushed_write(req)
+        response_processor.meta_get_with_value(cache_nils: cache_nils?(options), raw: raw_request?(options))
+      end
+
+      def quiet_get_request(key, options = nil)
+        # Skip bitflags in raw mode - saves 2 bytes per request and skips parsing
+        RequestFormatter.meta_get(key: key, return_cas: true, quiet: true, skip_flags: raw_request?(options),
+                                  **routing_token_kwargs(options))
+      end
+
+      # Same requests as quiet_get_request for each key, built in one pass
+      # and without the trailing noop.
+      def quiet_get_requests(keys, options = nil, return_cas: true)
+        RequestFormatter.multi_meta_get(keys, skip_flags: raw_request?(options), return_cas: return_cas,
+                                              terminate: false, **routing_token_kwargs(options))
+      end
+
+      def gat(key, ttl, options = nil)
+        ttl = TtlSanitizer.sanitize(ttl)
+        skip_flags = raw_mode? || (options && options[:raw])
+        req = RequestFormatter.meta_get(key: key, ttl: ttl, skip_flags: skip_flags, **routing_token_kwargs(options))
+        flushed_write(req)
+        response_processor.meta_get_with_value(cache_nils: cache_nils?(options), raw: raw_request?(options))
+      end
+
+      def touch(key, ttl)
+        ttl = TtlSanitizer.sanitize(ttl)
+        req = RequestFormatter.meta_get(key: key, ttl: ttl, value: false)
+        flushed_write(req)
+        response_processor.meta_get_without_value
+      end
+
+      # TODO: This is confusing, as there's a cas command in memcached
+      # and this isn't it.  Maybe rename?  Maybe eliminate?
+      def cas(key, options = nil)
+        req = RequestFormatter.meta_get(key: key, value: true, return_cas: true, skip_flags: raw_request?(options),
+                                        **routing_token_kwargs(options))
+        flushed_write(req)
+        response_processor.meta_get_with_value_and_cas(raw: raw_request?(options))
+      end
+
+      # Comprehensive meta get with support for all metadata flags.
+      # @note Requires memcached 1.6+ (meta protocol feature)
+      #
+      # This is the full-featured get method that supports:
+      # - Thundering herd protection (vivify_ttl, recache_ttl)
+      # - Item metadata (hit_status, last_access)
+      # - LRU control (skip_lru_bump)
+      #
+      # @param key [String] the key to retrieve
+      # @param options [Hash] options controlling what metadata to return
+      #   - :vivify_ttl [Integer] creates a stub on miss with this TTL (N flag)
+      #   - :recache_ttl [Integer] wins recache race if remaining TTL is below this (R flag)
+      #   - :return_hit_status [Boolean] return whether item was previously accessed (h flag)
+      #   - :return_last_access [Boolean] return seconds since last access (l flag)
+      #   - :skip_lru_bump [Boolean] don't bump LRU or update access stats (u flag)
+      #   - :cache_nils [Boolean] whether to cache nil values
+      # @return [Hash] containing:
+      #   - :value - the cached value (or nil on miss)
+      #   - :cas - the CAS value
+      #   - :won_recache - true if client won recache race (W flag)
+      #   - :stale - true if item is stale (X flag)
+      #   - :lost_recache - true if another client is recaching (Z flag)
+      #   - :hit_before - true/false if previously accessed (only if return_hit_status: true)
+      #   - :last_access - seconds since last access (only if return_last_access: true)
+      def meta_get(key, options = {})
+        # vivify_ttl is how long the stub lives, so like any TTL it must be
+        # sanitized: memcached reads a value over 30 days as a Unix timestamp.
+        # recache_ttl is a threshold compared with the remaining TTL, not an
+        # expiry, so it's sent as given.
+        vivify_ttl = options[:vivify_ttl] && TtlSanitizer.sanitize(options[:vivify_ttl])
+        req = RequestFormatter.meta_get(
+          key: key, value: true, return_cas: true, skip_flags: raw_request?(options),
+          vivify_ttl: vivify_ttl, recache_ttl: options[:recache_ttl],
+          return_hit_status: options[:return_hit_status],
+          return_last_access: options[:return_last_access],
+          return_ttl_remaining: options[:return_ttl_remaining],
+          skip_lru_bump: options[:skip_lru_bump],
+          **routing_token_kwargs(options)
+        )
+        flushed_write(req)
+        response_processor.meta_get_with_metadata(
+          cache_nils: cache_nils?(options), return_hit_status: options[:return_hit_status],
+          return_last_access: options[:return_last_access],
+          return_ttl_remaining: options[:return_ttl_remaining], raw: raw_request?(options)
+        )
+      end
+
+      # Delete with stale invalidation instead of actual deletion.
+      # Used with thundering herd protection to mark items as stale rather than removing them.
+      # @note Requires memcached 1.6+ (meta protocol feature)
+      #
+      # @param key [String] the key to invalidate
+      # @param cas [Integer] optional CAS value for compare-and-swap
+      # @return [Boolean] true if successful
+      def delete_stale(key, cas = nil)
+        req = RequestFormatter.meta_delete(key: key, cas: cas, stale: true)
+        flushed_write(req)
+        response_processor.meta_delete
+      end
+
+      # Storage Commands
+      def set(key, value, ttl, cas, options)
+        write_storage_req(:set, key, value, ttl, cas, options)
+        response_processor.meta_set_with_cas unless quiet?
+      end
+
+      # Pipelined set - writes a quiet set request without reading response.
+      # Used by PipelinedSetter for bulk operations.
+      def pipelined_set(key, value, ttl, options)
+        write_storage_req(:set, key, value, ttl, nil, options, quiet: true)
+      end
+
+      def add(key, value, ttl, options)
+        write_storage_req(:add, key, value, ttl, nil, options)
+        response_processor.meta_set_with_cas unless quiet?
+      end
+
+      def replace(key, value, ttl, cas, options)
+        write_storage_req(:replace, key, value, ttl, cas, options)
+        response_processor.meta_set_with_cas unless quiet?
+      end
+
+      def write_storage_req(mode, key, raw_value, ttl = nil, cas = nil, options = {}, quiet: quiet?)
+        (value, bitflags) = @value_marshaller.store(key, raw_value, options)
+        ttl = TtlSanitizer.sanitize(ttl) if ttl
+        # eql?(0): only Integer 0 means "no CAS" here; anything else takes the general path
+        req = if mode == :set && !quiet && (cas.nil? || cas.eql?(0)) && !routing_tokens?(options)
+                RequestFormatter.plain_meta_set(key, value.bytesize, bitflags, ttl)
+              else
+                RequestFormatter.meta_set(key: key, value: value,
+                                          bitflags: bitflags, cas: cas,
+                                          ttl: ttl, mode: mode, quiet: quiet,
+                                          **routing_token_kwargs(options))
+              end
+        write("#{req}#{value}#{TERMINATOR}")
+        finish_write(quiet)
+      end
+      # rubocop:enable Metrics/ParameterLists
+
+      def append(key, value, options = nil)
+        write_append_prepend_req(:append, key, value, nil, nil, options)
+        response_processor.meta_set_append_prepend unless quiet?
+      end
+
+      def prepend(key, value, options = nil)
+        write_append_prepend_req(:prepend, key, value, nil, nil, options)
+        response_processor.meta_set_append_prepend unless quiet?
+      end
+
+      # rubocop:disable-next Metrics/ParameterLists
+      def write_append_prepend_req(mode, key, value, ttl = nil, cas = nil, options = nil)
+        ttl = TtlSanitizer.sanitize(ttl) if ttl
+        req = RequestFormatter.meta_set(key: key, value: value,
+                                        cas: cas, ttl: ttl, mode: mode, quiet: quiet?,
+                                        **routing_token_kwargs(options))
+        write("#{req}#{value}#{TERMINATOR}")
+        finish_write(quiet?)
+      end
+
+      # Delete Commands
+      #
+      # `options` supports the meta-delete keys :invalidate, :tombstone_ttl and
+      # :drop_value, plus :p_token/:l_token; see Dalli::Client#delete.
+      def delete(key, cas, options = nil)
+        # Fast path for a plain delete: no options, no CAS, not quiet
+        req = if options.nil? && (cas.nil? || cas.eql?(0)) && !quiet?
+                RequestFormatter.plain_meta_delete(key)
+              else
+                RequestFormatter.meta_delete(key: key, cas: cas, quiet: quiet?,
+                                             **tombstone_kwargs(options), **routing_token_kwargs(options))
+              end
+        write(req)
+        finish_write(quiet?)
+        response_processor.meta_delete unless quiet?
+      end
+
+      # Pipelined delete - writes a quiet delete request without reading response.
+      # Used by PipelinedDeleter for bulk operations.
+      def pipelined_delete(key, req_options = nil)
+        req = RequestFormatter.meta_delete(key: key, quiet: true,
+                                           **tombstone_kwargs(req_options), **routing_token_kwargs(req_options))
+        write(req)
+      end
+
+      def finish_pipelined_delete(sent)
+        write_noop
+        sent - response_processor.pipelined_delete_non_deletions
+      end
+
+      # Arithmetic Commands
+      def decr(key, count, ttl, initial, options = nil)
+        decr_incr false, key, count, ttl, initial, options
+      end
+
+      def incr(key, count, ttl, initial, options = nil)
+        decr_incr true, key, count, ttl, initial, options
+      end
+
+      # rubocop:disable-next Metrics/ParameterLists
+      def decr_incr(incr, key, delta, ttl, initial, options = nil)
+        ttl = initial ? TtlSanitizer.sanitize(ttl) : nil # Only set a TTL if we want to set a value on miss
+        # memcached stores an item created by ma's auto-create (N/J) for a
+        # base64-encoded key without its binary-key flag, and later replies
+        # name it with the raw key bytes. Create such counters with an add.
+        return decr_incr_with_add(incr, key, delta, ttl, initial, options) if initial && KeyRegularizer.required?(key)
+
+        write(RequestFormatter.meta_arithmetic(key: key, delta: delta, initial: initial, incr: incr, ttl: ttl,
+                                               quiet: quiet?, **routing_token_kwargs(options)))
+        finish_write(quiet?)
+        response_processor.decr_incr unless quiet?
+      end
+
+      # Like decr_incr with an initial value, without memcached's auto-create:
+      # on a miss the counter is added with the initial value (which is
+      # returned, as auto-create would), and the add losing a race to another
+      # client means the counter now exists, so the incr is tried again. In a
+      # quiet block both requests are sent and whichever applies takes effect.
+      # rubocop:disable-next Metrics/ParameterLists
+      def decr_incr_with_add(incr, key, delta, ttl, initial, options)
+        add_options = (options || {}).merge(raw: true) # counters are stored raw
+        return quiet_decr_incr_with_add(incr, key, delta, ttl, initial, add_options) if quiet?
+
+        2.times do
+          value = decr_incr(incr, key, delta, nil, nil, options)
+          return value unless value.nil?
+
+          write_storage_req(:add, key, initial.to_s, ttl, nil, add_options, quiet: false)
+          return initial if response_processor.meta_set_with_cas
+        end
+        decr_incr(incr, key, delta, nil, nil, options)
+      end
+
+      # rubocop:disable-next Metrics/ParameterLists
+      def quiet_decr_incr_with_add(incr, key, delta, ttl, initial, add_options)
+        write(RequestFormatter.meta_arithmetic(key: key, delta: delta, initial: nil, incr: incr, ttl: nil,
+                                               quiet: true, **routing_token_kwargs(add_options)))
+        write_storage_req(:add, key, initial.to_s, ttl, nil, add_options, quiet: true)
+        finish_write(true)
+      end
+
+      # Other Commands
+      def flush(delay = 0)
+        write(RequestFormatter.flush(delay: delay))
+        finish_write(quiet?)
+        response_processor.flush unless quiet?
+      end
+
+      # Noop is a keepalive operation but also used to demarcate the end of a set of pipelined commands.
+      # We need to read all the responses at once.
+      # A write that expects a reply is flushed so the reply can be read. A write
+      # in a quiet block stays buffered until a noop: the one at the end of the
+      # block, or the one another thread or fiber sends to drain the block's
+      # replies before its own request. With defer_drain no noop follows at the
+      # end of the block, so it is flushed right away. (pipelined_set passes
+      # quiet: true outside a quiet block; its caller flushes with a
+      # terminating noop.)
+      def finish_write(quiet)
+        @connection_manager.flush if !quiet || (@defer_drain && quiet?)
+      end
+
+      def noop
+        write_noop
+        result = response_processor.consume_all_responses_until_mn
+        # Everything up to and including the MN has been read
+        @connection_manager.clear_quiet_responses_pending!
+        result
+      end
+
+      def stats(info = nil)
+        flushed_write(RequestFormatter.stats(info))
+        response_processor.stats
+      end
+
+      def reset_stats
+        flushed_write(RequestFormatter.stats('reset'))
+        response_processor.reset
+      end
+
+      def version
+        flushed_write(RequestFormatter.version)
+        response_processor.version
+      end
+
+      def write_noop
+        flushed_write(RequestFormatter.meta_noop)
+      end
+
+      # Single-server fast path for get_multi. Inlines request formatting and
+      # response parsing to minimize per-key overhead. Avoids the PipelinedGetter
+      # machinery (IO.select, response buffering, server grouping).
+      def read_multi_req(keys, options = nil)
+        is_raw = raw_request?(options)
+        buffer = RequestFormatter.multi_meta_get(keys, skip_flags: is_raw, **routing_token_kwargs(options))
+        flushed_write(buffer)
+        buffer.clear
+        read_multi_get_responses(is_raw, keys)
+      end
+
+      # Stale-aware bulk get.  Returns { key => { value:, cas:, stale:, miss: } }
+      # for the keys the server returned.  Keys that were not found are absent
+      # from the hash, matching read_multi_req and the get_multi family; a
+      # tombstoned item is present (it answers VA with the X flag) with
+      # stale: true, which is the distinction callers need.
+      #
+      # Shared by both the single-server fast path and PipelinedGetter's
+      # per-server-group request, so this one change covers both routes.
+      def read_multi_with_metadata_req(keys, options = nil)
+        is_raw = raw_request?(options)
+        buffer = RequestFormatter.multi_meta_get(keys, skip_flags: is_raw, return_cas: true,
+                                                       **routing_token_kwargs(options))
+        flushed_write(buffer)
+        buffer.clear
+        read_multi_metadata_responses(is_raw, keys)
+      end
+
+      # Unlike read_multi_get_responses this locates tokens by flag rather than
+      # by position, because the c flag shifts the key's index.
+      def read_multi_metadata_responses(is_raw, keys)
+        expect_reply_keys(keys)
+        hash = {}
+        unmarshal_error = nil
+        while (line = @connection_manager.read_line)
+          break if line.start_with?('MN')
+          next unless line.start_with?('VA ')
+
+          tokens = line.chomp!(TERMINATOR).split
+          size = tokens[1].to_i
+          response_processor.check_value_size!(size)
+          value = @connection_manager.read(size + TERMINATOR.bytesize)&.chomp!(TERMINATOR)
+          stale = response_processor.stale_from_tokens(tokens)
+          cas = response_processor.cas_from_tokens(tokens)
+          bitflags = is_raw ? 0 : response_processor.bitflags_from_tokens(tokens)
+          key = response_processor.key_from_tokens(tokens)
+          next if key.nil?
+
+          raise_unexpected_reply_key(key) if unexpected_reply_key?(key)
+
+          begin
+            hash[key] = { value: @value_marshaller.retrieve(value, bitflags), cas: cas, stale: stale, miss: false }
+          rescue Dalli::UnmarshalError => e
+            # Raised once the rest of the replies are read; see read_multi_get_responses
+            unmarshal_error ||= e
+          end
+        end
+        raise unmarshal_error if unmarshal_error
+
+        hash
+      end
+
+      # A value that can't be deserialized raises Dalli::UnmarshalError, as
+      # get does, but only after the rest of the replies are read, so the
+      # connection is left in step. The first such error is raised.
+      def read_multi_get_responses(is_raw, keys)
+        expect_reply_keys(keys)
+        hash = {}
+        unmarshal_error = nil
+        while (line = @connection_manager.read_line)
+          break if line.start_with?('MN')
+          next unless line.start_with?('VA ')
+
+          begin
+            key, value = parse_multi_get_value(line, is_raw)
+          rescue Dalli::UnmarshalError => e
+            unmarshal_error ||= e
+            next
+          end
+          hash[key] = value if key
+        end
+        raise unmarshal_error if unmarshal_error
+
+        hash
+      end
+
+      # The replies after a key that wasn't requested can't be trusted (see
+      # Base#expect_reply_keys). Raising ends the request, which closes the
+      # connection; the caller treats this server's keys as missing.
+      def raise_unexpected_reply_key(key)
+        raise Dalli::UnexpectedReplyKeyError, "#{name} replied with a key that wasn't requested: #{key.inspect}"
+      end
+
+      # Reads the "VA <size> [f<flags>] k<key> ..." line in place rather than
+      # splitting it into tokens
+      def parse_multi_get_value(line, is_raw)
+        processor = response_processor
+        size = processor.size_from_va_line(line)
+        processor.check_value_size!(size)
+        value = @connection_manager.read(size + TERMINATOR.bytesize)&.chomp!(TERMINATOR)
+        key = processor.key_from_va_line(line)
+        return unless key
+
+        raise_unexpected_reply_key(key) if unexpected_reply_key?(key)
+        bitflags = is_raw ? 0 : processor.bitflags_from_va_line(line)
+        [key, @value_marshaller.retrieve(value, bitflags)]
+      end
+
+      # Single-server fast path for set_multi. Inlines request formatting to
+      # minimize per-key overhead. Avoids PipelinedSetter server grouping.
+      #
+      # A value that can't be marshalled or is over value_max_bytes is skipped;
+      # the other keys are still stored, then the first such error is raised
+      # (as PipelinedSetter does on the multi-server path).
+      def write_multi_req(pairs, ttl, req_options)
+        ttl = TtlSanitizer.sanitize(ttl) if ttl
+        value_error = nil
+        entries = pairs.filter_map do |key, raw_value|
+          [key, @value_marshaller.store(key, raw_value, req_options)]
+        rescue Dalli::MarshalError, Dalli::ValueOverMaxSize => e
+          value_error ||= e
+          nil
+        end
+
+        unless entries.empty?
+          buffer = RequestFormatter.multi_meta_set(entries, ttl: ttl, **routing_token_kwargs(req_options))
+          flushed_write(buffer)
+          buffer.clear
+          response_processor.consume_all_responses_until_mn
+        end
+        raise value_error if value_error
+      end
+
+      # Single-server fast path for delete_multi. Writes all quiet delete requests
+      # terminated by a noop, then consumes all responses.
+      def delete_multi_req(keys, req_options = nil)
+        buffer = RequestFormatter.multi_meta_delete(keys, **tombstone_kwargs(req_options),
+                                                    **routing_token_kwargs(req_options))
+        flushed_write(buffer)
+        buffer.clear
+        keys.size - response_processor.pipelined_delete_non_deletions
+      end
+
+      require_relative 'key_regularizer'
+      require_relative 'request_formatter'
+      require_relative 'response_processor'
+    end
+  end
+end

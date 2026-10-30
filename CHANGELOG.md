@@ -1,0 +1,1405 @@
+Dalli Changelog
+=====================
+
+Unreleased
+==========
+
+Bug fixes:
+
+- A `vivify_ttl` (or `fetch_with_lock`'s `lock_ttl`) over 30 days now protects against a thundering herd. memcached reads a TTL over 30 days as a Unix timestamp, so the stub for a miss expired at once and every caller won the recache race. `vivify_ttl` is now converted like other TTLs
+- `set_cas`, `replace_cas` and `delete_cas` dropped a CAS that couldn't be parsed, such as `'abc'`, and sent an unconditional write, so the value was overwritten or deleted whatever its CAS. They now raise `ArgumentError`
+- `flush('abc')` flushed immediately. It now raises `ArgumentError`
+- A TTL String that isn't a whole number, such as `'abc'`, became 0, which means no expiry. It now raises `ArgumentError`, including for `expires_in` when the client is created
+- A TTL, CAS, `incr`/`decr` amount or initial value outside the range memcached accepts got a `CLIENT_ERROR` reply, which a `quiet` block or `set_multi` discarded, so the write silently did nothing. These now raise `ArgumentError`
+- An invalid `vivify_ttl` raised from deep in the request and closed the connection
+- Multi-gets now raise `Dalli::UnmarshalError` for a value that can't be deserialized, as `get` does, and only after reading the rest of the replies
+  - `get_multi` and `get_multi_cas` raised partway through reading a server's replies, closing the connection, and `get_multi_with_metadata` on more than one server silently dropped every key on that server. A large `get_multi` could also drop that server's keys without raising when it read the bad value while still sending requests (seen mostly on JRuby and TruffleRuby)
+  - In block form the other values are still yielded, and the connections stay open. `get` and the other single-key reads also keep the connection open after this error now
+- `get_multi`, `get_multi_cas` and `get_multi_with_metadata` now return each value under the key the caller passed. They rebuilt the key from the one memcached returned, so:
+  - With a namespace, a key that isn't valid UTF-8 (such as `"\xff".b`) raised `ArgumentError` for the whole call
+  - A key too long to send as is (over 250 bytes, or once base64-encoded) came back under its digested form
+  - A binary key with non-ASCII bytes came back tagged UTF-8, so `result.key?(key)` was false
+  - A key given more than once is now requested once, and a block is yielded it once
+- `set_multi` across more than one server stored `nil` for a Symbol key or a key over 250 bytes, in place of the value given
+- On TruffleRuby, a process spawned while Dalli had a connection open (with `system`, `spawn` or backticks) inherited the socket and kept the connection open on memcached's side until it exited. Dalli's sockets are now close-on-exec, as CRuby makes them by default
+- A request that failed after it was sent, such as one whose reply timed out, was sent again even though memcached may have applied it. `incr`, `decr`, `append` and `prepend` could be applied twice, and `add` and writes with a CAS could report failure for a write that had succeeded. Once some of a request has been sent, Dalli now retries only requests that are safe to apply twice (see Other changes)
+
+Other changes:
+
+- Numeric arguments are checked before anything is written, so a bad one raises `ArgumentError` without affecting the connection or earlier writes in a `quiet` block. Integers and Strings of decimal digits (such as `'300'`) are accepted throughout
+  - A TTL (`ttl`, `expires_in`, `vivify_ttl`, `lock_ttl`, `tombstone_ttl`) must fit memcached's signed 32-bit expiration time once a TTL over 30 days is converted to a Unix time. A negative TTL is still accepted and expires the item. A Float or `ActiveSupport::Duration` TTL is still converted with `to_i`
+  - A CAS, an `incr`/`decr` amount or initial value, and a `flush` delay must be from 0 to 2**64 - 1. A Float now raises; `incr(key, 0.9)` used to truncate the amount to 0. A String amount such as `'5'` now works
+  - `fetch_with_lock` checks `ttl` before taking the lock, so a bad one raises before the block runs
+  - `Dalli::Protocol::TtlSanitizer.sanitize` raises `ArgumentError` for a String that isn't a whole number instead of returning 0
+- `incr`, `decr`, `append`, `prepend`, `add`, `set_cas`, `replace_cas`, `delete_cas`, `cas`, `cas!`, `fetch_with_lock`, and `get_with_metadata` with `vivify_ttl` or `recache_ttl` now raise `Dalli::NetworkError` when the connection fails after the request was sent, where they used to retry it. Reads, `touch`, `set`, `replace` and `delete` without a CAS, and the multi-key operations are still retried, as is any request that failed before it was sent
+  - `fetch` (which stores a missing value with `add`) and `Rack::Session::Dalli` (which creates sessions with `add`) can see this error too. `Rack::Session::Dalli` handles it like any other memcached error
+
+5.2.4
+==========
+
+Security:
+
+- Keep a connection shared by several threads or fibers in step during a `quiet` block (GHSA-5xvx-r8rg-5qm2)
+  - A `quiet` (or `multi`) block is quiet only for the thread or fiber that runs it. memcached still replies to a quiet request that fails (for example an `add` of a key that exists), and another thread or fiber using the same client while the block was open read that reply as its own, so its later requests could return another key's value. A non-quiet request now reads any pending quiet replies first
+- Don't let a `get_multi` that stopped early leave replies for a later request (GHSA-5xvx-r8rg-5qm2)
+  - A pipelined `get_multi` stopped by a non-network exception (its block raising or breaking, `Timeout.timeout`, or a value that can't be deserialized) left its unread replies in the response buffer, and a later `get_multi` large enough to use the interleaved path returned them as its own. The buffer is now cleared when a connection closes or a pipelined get starts, and unfinished pipelines are aborted
+  - Affects every supported line (the `get_multi` issue, 4.3 and later); fixed in 5.2.4, 5.1.6, 5.0.12, 4.3.9 and 3.2.15. On 5.2, clients with `defer_drain: true` weren't affected by the `quiet` issue
+
+Bug fixes:
+
+- A failed TLS handshake is now handled as a network error even when openssl wasn't loaded before Dalli
+  - The fix in 5.2.3 (#1215) took effect only when the application had already required openssl: otherwise Dalli's list of TLS errors was empty, so a failed handshake still raised `OpenSSL::SSL::SSLError` and left the socket open
+
+5.2.3
+==========
+
+Security:
+
+- Don't rely on memcached's auto-create for keys that need base64 encoding (GHSA-r47x-6p6r-mvcp)
+  - memcached stores an item made by auto-create (`ma` with `N`/`J`, or `mg` with `N`) for a base64-encoded key without its binary-key flag, and later replies name the item by its raw key bytes. A key containing spaces or CR/LF could then make a multi-get read the replies after it as different ones
+  - `incr` and `decr` with an initial value now create such counters with an add instead. Return values are unchanged
+  - The new `verify_reply_keys` option makes `get_multi`, `get_multi_cas` and `get_multi_with_metadata` ignore replies for keys they didn't request, which guards against items created by older Dalli versions or other clients until memcached is upgraded. It's off by default, since it costs a multi-get about 15%
+  - Affects the meta protocol since 3.2.0; fixed in 5.2.3, 5.1.5, 5.0.11, 4.3.8 and 3.2.14. memcached 1.6.45 and earlier still name these items by their raw key bytes
+
+Bug fixes:
+
+- `get_multi_with_metadata` and its `CacheResult` adapter now retry transient network errors and raise `Dalli::NetworkError` on terminal failures instead of returning misses or partial results (#1222, @jaideeppyne)
+- A per-request `raw: true` write no longer compresses the value (#1213)
+  - Values at or above the compression threshold (4 KB by default) were compressed and flagged even with `raw: true`. Raw reads ignore flags, so reading them back with `raw: true` returned the compressed bytes
+  - Raw values are now stored exactly as given. Callers that pass `raw: true` without `compress: false` store large values uncompressed; Rails' `MemCacheStore` passes `compress: false` and isn't affected
+- Fix `cas` and `cas!` edge cases, and make `flush` attempt every server (#1214)
+  - `cas!` on a missing key used an unconditional set, so a value another client created while the block ran was overwritten. It now adds the key and returns `false` if another client got there first
+  - With `cache_nils: true`, `cas` treated a stored `nil` as a miss and didn't call the block
+  - The docs now say what `cas` and `cas!` return on success: the new CAS value, not `true`. The return values are unchanged
+  - `flush` stopped at the first server that raised, so later servers weren't flushed. It now flushes every server it can reach, then raises the first error
+- Handle failed TLS handshakes like other connection failures, and warn when TLS verification is off (#1215)
+  - A failed or timed-out handshake left the TCP socket open until GC and raised `OpenSSL::SSL::SSLError` directly, so the server was never marked down. The socket is now closed, and the error goes through the usual retry and `socket_max_failures` handling, raising `Dalli::NetworkError` (or `Dalli::RingError` once no server is available)
+  - Certificate and hostname checks come only from the `ssl_context` you pass, and a bare `OpenSSL::SSL::SSLContext.new` checks neither. Dalli now logs a warning once per process when `verify_mode` doesn't include `VERIFY_PEER` or `verify_hostname` is false; see the new TLS section in the README
+- Connection and configuration fixes (#1216)
+  - `memcached://` URIs with a bracketed IPv6 host (`memcached://[::1]:11211`) now connect
+  - A server weight below 1 raises `ArgumentError`. Before, a ring where every weight was 0 raised `FloatDomainError`
+  - A reply line longer than 8 KiB without a CRLF, or one cut short by the connection closing, is now a network error that closes the connection. Before, the line had no length limit
+  - On CRuby, DNS resolution is now limited by `socket_timeout` (`resolv_timeout:`) as well as the connect
+- `Dalli::Client.new` no longer modifies the options hash it's given, and accepts a frozen one (#1217)
+- `value_max_bytes` now counts the key and memcached's per-item overhead (#1217)
+  - memcached's `-I` limit covers the whole item, not only the value. A value of exactly 1 MB passed Dalli's check and then failed in memcached with `Dalli::ServerError`, which `quiet` blocks and `set_multi` silently discarded
+  - Dalli now checks value + key + 63 bytes, the overhead measured on memcached 1.6, and raises `Dalli::ValueOverMaxSize` before sending. A custom `value_max_bytes` is now that much stricter
+  - A String `value_max_bytes` is converted to an Integer instead of raising on every set
+- `Rack::Session::Dalli` fixes (#1217)
+  - It no longer requires the `connection_pool` gem unless `pool_size` or `pool_timeout` is given
+  - `pool_size` and `pool_timeout` are no longer passed to `Dalli::Client`, and the options hash isn't modified
+  - A failed session delete is logged as a warning, not only when `$VERBOSE` is set
+- One value that can't be stored no longer discards other buffered writes (#1218)
+  - A value that raised `Dalli::MarshalError` or `Dalli::ValueOverMaxSize` closed the connection, which dropped writes still buffered from the same `quiet` block or `set_multi`. Multi-server `set_multi` did this without raising
+  - Both `set_multi` paths now store every other key, skip the bad one, and then raise. Single-server `set_multi` used to store nothing
+  - When single-server `set_multi` failed to marshal a value, the error log included every value in the batch. It now lists only the keys
+- `Rack::Session::Dalli`'s 401 for a session deleted mid-request is now a valid Rack response (#1220)
+  - When a session is deleted while a request is using it (for example, by a logout in another request), the store still returns 401 instead of writing the session back. The 401 now has a `content-type` and expires the session cookie, so the browser stops sending the dead session ID
+  - The app's response body is now closed, as the Rack spec requires. Before, it was dropped without `close`
+  - The app has already run when the 401 is returned, so its side effects have happened. This is documented in the README
+
+Improvements:
+
+- Add a `connect_timeout` option to set a separate timeout for DNS resolution and TCP/UNIX socket connects (including reconnects); it defaults to `socket_timeout`. TLS handshakes continue to use `socket_timeout` (#1221, @underwoo16)
+
+5.2.2
+==========
+
+Security:
+
+- Keep the caller's key when retrying a request (GHSA-m252-9cgf-vx2w)
+  - With a `namespace`, a request retried after a transient network error (a timeout, or a connection closed by memcached or a proxy) applied the namespace a second time, so a retried read could return a different key's value and a retried write could overwrite a different key
+  - Affects single-key operations since 5.0.3, single-server `get_multi` since 5.1.0, and `get_with_metadata` and `fetch_with_lock` since 4.1.0; fixed in 5.2.2, 5.1.4, 5.0.10 and 4.3.7. Clients without a namespace aren't affected
+- Complete the fix for per-request `raw: true` on reads (GHSA-wr87-m4jw-29x5)
+  - A read made with `raw: true` doesn't ask for flags, but a reply carrying them anyway (from a proxy or a hostile server) still had its value deserialized. Raw reads now ignore flags in the reply
+  - Affects 5.2.1 and earlier; fixed in 5.2.2, 5.1.4, 5.0.10, 4.3.7 and 3.2.13
+
+Bug fixes:
+
+- `get_with_metadata` and `fetch_with_lock` retried the final error raised when a server is marked down, so with `down_retry_delay: 0` they retried an unresponsive server forever. They now retry only retryable errors, like other operations
+- Fix a regression in 5.2.1: a `get_multi` that didn't finish within `socket_timeout` counted toward `socket_max_failures`, so two slow `get_multi` calls in a row marked a healthy server down. It now just closes the connection
+- Fix a regression in 5.2.1: over TLS, every request buffered in a `quiet` block was sent as its own TLS record and system call (2.5 times slower for a block of 2000 deletes). Each flush is one write again
+- Handle malformed replies from a broken or hostile server or proxy: a negative value size, a hit with no key, or a hit with no `s` flag could leave the connection out of step or raise a non-Dalli error
+- With `decompressed_max_bytes` in effect, data after the end of a compressed value's stream was returned as part of the value. It's now ignored, as without the limit
+- With a `digest_class` whose digests aren't short hex strings, shortening a long key could loop forever. It now raises `ArgumentError`
+
+Notes:
+
+- Document how long keys are shortened, and that a short key written in the same form names the same item, in the README's security note (#1200)
+
+Development:
+
+- Run the Tests, RuboCop and Profiles workflows on pushes to `main` and the `*-stable` branches only, so a pull request's branch isn't tested twice (once for the push and once for the pull request) (#1198)
+
+5.2.1
+==========
+
+Security:
+
+- Fix pipelined `get_multi` returning one key's value for another after an error reply (GHSA-p6pm-ch9v-44vx)
+  - The pipelined reply parser took any reply without a body for the end of the batch. An error reply for one key (`CLIENT_ERROR`, `SERVER_ERROR`, or `EN` from a proxy) ended it early, and the replies still on the connection were read as the replies to later commands, so a `get` could return another key's value
+  - Keys are now measured in bytes as sent, after base64 encoding when the key needs it. A key under 250 characters but over 250 bytes on the wire (for example, one with many non-ASCII characters) was the easiest way to cause that error reply. Such keys are now truncated like other long keys; keys that worked before are unchanged
+  - Affects the meta protocol since 3.2.0 (the default since 5.0.0); fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Reject routing tokens that add meta flags, and stop retrying an unresponsive server forever (GHSA-4qp6-2jcr-596v)
+  - `p_token` and `l_token` now reject whitespace and control characters, not just CR, LF and NUL. A space let a token add meta flags to the request it was sent with: changing an item's TTL on a read, creating stub items on a miss, turning a delete into a stale tombstone, or reading a different key
+  - Affects 5.1.0 and later; fixed in 5.2.1 and 5.1.3
+  - A server that accepted connections but never answered (or dropped the connection on a request) was retried forever, hanging the caller, because each successful reconnect reset the failure count. Requests now fail after `socket_max_failures` attempts and the server is marked down, as when it can't be reached at all; it gets a full set of attempts again after `down_retry_delay`
+  - Affects all versions; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Limit decompressed and reply value sizes (GHSA-3553-vcg5-72jw)
+  - Values flagged as compressed were inflated without limit, so a small stored value could expand to gigabytes on read, whatever the client's `compress` or `serializer` settings. The new `decompressed_max_bytes` option (default 128 MiB; `nil` disables it) makes a read that would pass it raise `Dalli::UnmarshalError`. Custom compressors whose `decompress` takes only the data keep working, without the limit
+  - The value size in a reply was used to read or buffer that many bytes, so a malicious server could make the client allocate gigabytes. Sizes over 1 GiB, memcached's largest item, now raise `Dalli::DalliError` before reading
+  - Affects all versions; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Honor per-request `raw: true` on reads, and add `Dalli::JSONSerializer` (GHSA-wr87-m4jw-29x5)
+  - `get_multi`, `get_multi_cas`, `get_multi_with_metadata`, `get_cas` and `get_with_metadata` ignored a per-request `raw: true` and deserialized the value according to its stored flags, so a caller who asked for raw bytes could still have `Marshal.load` run on data someone else wrote to memcached. They now return the stored bytes
+  - The `raw` part affects `get_with_metadata` since 4.2.0, and the other methods since they gained per-request options in 5.1.0
+  - `serializer: JSON` reads values with `JSON.load`, which on json gem versions before 3.0 creates an object of the class named in a stored `json_class` key when the json additions are loaded. The new `Dalli::JSONSerializer` reads with `JSON.parse` and only returns plain JSON types. The README and the Marshal security warning now recommend it; `serializer: JSON` itself is unchanged
+  - The `serializer: JSON` part affects any version used with the json gem before 3.0
+- Keep a forked child from writing to or closing the parent's connection (GHSA-w39f-xq2m-4g8x)
+  - A child forked while the parent had requests buffered but not yet sent, such as quiet writes inside a `quiet` block, sent them again when it closed the client or reconnected: quiet writes ran twice, and the parent's later replies could be read as the replies to other requests, returning one key's value for another. Dalli now buffers requests itself and a forked child discards them
+  - Affects 4.2.0 and later; fixed in 5.2.1, 5.1.3, 5.0.9 and 4.3.6
+  - With TLS, a forked child that closed the client (or reconnected after detecting the fork) sent a TLS close on the connection the parent was still using, ending the parent's session. A forked child now closes only its own copy of the socket
+  - Affects all versions with TLS; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+
+Bug fixes:
+
+- An exception raised by a `get_multi` block (such as `Timeout::Error`) was treated as a network failure: swallowed, with the whole `get_multi` retried and keys yielded twice. It now reaches the caller
+
+Notes:
+
+- Document [Ruby bug 21195](https://bugs.ruby-lang.org/issues/21195), a VM crash (`[BUG] rb_sys_fail_path_in(io_fillbuf, ...) - errno == 0`) when a socket read using `IO#timeout` is interrupted by a signal, in the README (#1189)
+  - Affects Ruby 3.3.0–3.3.7 and 3.4.0–3.4.2; fixed in 3.3.8 and 3.4.3
+
+Development:
+
+- Add property tests for request building and fuzz tests for the reply parsers
+- Add a security policy (`SECURITY.md`), give every workflow a least-privilege token, and pin third-party actions by commit SHA (#1190)
+- Fix flaky failover tests (#1184)
+  - Their ports were inside Linux's ephemeral port range (32768-60999), so an earlier client connection could hold one as its local port. memcached then couldn't bind it on IPv4 and listened on IPv6 only, and the test's client marked that server down. They now use ports in the 26xxx range
+  - The test helper now waits until memcached accepts connections, instead of sleeping a fixed 0.1s after starting it
+- Refresh apt's package index before installing libevent in CI, so a stale runner image can't break every memcached build (#1172)
+
+5.2.0
+==========
+
+Features:
+
+- Add `Dalli::CacheResult`, returned by the new `#get_with_metadata_result` and `#get_multi_with_metadata_result` (#1156)
+  - An opt-in, typed view over the Hash that `#get_with_metadata` and `#get_multi_with_metadata` already return; those methods are unchanged, and changing their return type is left for a future major version (#1151)
+  - `value`, `cas`, `hit_before`, `last_access` and `ttl_remaining` readers (the last three are `nil` unless requested), plus `miss?`, `hit?`, `stale?`, `won_recache?` and `lost_recache?` predicates
+  - Results are frozen, and a Hash that claims to be both a miss and stale raises `ArgumentError`
+  - `#get_multi_with_metadata_result` omits misses and accepts `req_options:`, like `#get_multi_with_metadata`; it has no block form
+- Add the opt-in `defer_drain` client option (#1168)
+  - With `defer_drain: true`, a `quiet`/`multi` block no longer waits at its end for the replies to its requests. The requests are still sent right away; the replies are read with one noop per server just before the next non-quiet request to that server
+  - Adds `Client#drain_deferred_responses`, to drain at a boundary of the caller's choosing (the end of a web request or job)
+  - Tradeoff: an error reply to a quiet request surfaces (and is discarded) at that later point, not at the end of the block
+  - Off by default, so existing behavior is unchanged
+  - Replies memcached sends for quiet requests wait on the connection until they're drained, so a client that only makes quiet requests should call `drain_deferred_responses` periodically; see "Deferred Draining" in the README
+  - Thanks to Julian Richard Contreras and Matt Dick for this contribution
+
+Performance:
+
+- Skip the empty read at the end of each pipelined `read_available` call (#1164)
+  - A read shorter than the chunk size means the socket is drained, so the extra `read_nonblock` that only returned `:wait_readable` is gone; the `IO.select` loop still picks up anything that arrives later
+  - Saves one syscall per server per multi-server `get_multi`; on 4 servers a 3-key `get_multi` goes from 16% to 5% slower than 2.7.11 in the #930 benchmark
+  - TLS sockets also check `SSLSocket#pending`, since `IO.select` cannot see data OpenSSL has buffered
+  - Thanks to Julian Richard Contreras for this contribution
+- Reduce Ruby overhead on plain `set` and `delete` (#1166)
+  - A `set` with no CAS, routing tokens or quiet mode builds its `ms` request with one string interpolation (`RequestFormatter.plain_meta_set`), and a `delete` with no options uses `plain_meta_delete`; both produce the same bytes as before
+  - `HD c<cas>`, `HD` and `NF` replies are parsed without splitting them into tokens
+  - Allocations per `set` drop from 22 to 18, and per `delete` from 12 to 7
+  - Thanks to Julian Richard Contreras for this contribution
+- Only drain servers that were sent quiet requests when a `quiet`/`multi` block ends (#1167)
+  - Ending the block used to send a noop to every server in the ring and wait for each reply, one after another, so its cost grew with ring size even when the block touched one server (or none)
+  - Each connection now records when a quiet request is written, and the block's drain skips the others; servers that were never connected are no longer connected just to be drained
+  - With ~300us of network round trip, `multi { set }` on a 16-server ring goes from 4.9ms to 0.32ms; an empty block no longer touches the network
+  - Thanks to Julian Richard Contreras for this contribution
+- Reduce Ruby overhead in `get_multi` reply parsing and key routing (#1169)
+  - `VA` reply headers are read in place instead of being split into tokens, on both the multi-server (pipelined) and single-server paths; results are unchanged, and unusual headers still take the token path
+  - A key's server is found through a bucket table over the ring's continuum instead of a binary search, and the key's own server is tried before the failover loop; the server chosen for every key is unchanged
+  - Allocations for a 100-key `get_multi` on 4 servers drop from 1,500 to 1,104; over loopback it goes from 301us to 243us
+  - Thanks to Julian Richard Contreras for this contribution
+
+Bug fixes:
+
+- Fix multi-server `get_multi` stopping at an empty value (#1170)
+  - The pipelined reply parser took a hit on a zero-length value (`VA 0`) for the terminating `MN`, so that server's remaining keys were silently missing from the result
+  - Its value terminator and any replies not yet parsed stayed on the connection and were read as the replies to later commands on it. Those commands could fail with `Dalli::DalliError: Response error`, or a single-key `get` could silently return another key's value
+  - An empty value is now returned as `''`, like a single-key `get` and single-server `get_multi`
+  - Affects the meta protocol since 3.2.0 (the default since 5.0.0)
+  - Thanks to Julian Richard Contreras for this contribution
+
+5.1.1
+==========
+
+Security:
+
+- Fix memcached command injection through numeric arguments (GHSA-6wmv-xq9m-fmp7)
+  - The `default` argument of `incr`/`decr`, and `fetch_with_lock`'s `lock_ttl` and `recache_threshold`, were written into the meta protocol command without conversion, so a String containing CRLF injected additional memcached commands (e.g. `set`, `flush_all`) on the connection
+  - These arguments must now be Integers, or Strings of decimal digits; anything else raises `ArgumentError` before a request is sent
+  - As defense in depth, `RequestFormatter` now converts every numeric flag it writes (`D`, `J`, `N`, `R`, `T`) to an Integer
+  - Affects 3.2.0 and later (3.2.x only with `protocol: :meta`); fixed in 5.1.1 and 4.3.4
+  - Thanks to oss-security-shop for the report
+
+Performance:
+
+- Reduce Ruby overhead on the single-key `get` path by about 28% (#1160)
+  - A plain `get` builds its `mg` request with one string interpolation instead of going through `meta_get`'s keyword arguments, and skips option handling when called without options
+  - A `VA <size> f<flags>` hit line is parsed in place instead of being split into tokens
+  - The key check for control characters and whitespace uses a byte class that matches the same ASCII bytes as `[\p{Cntrl}\s]`, about 5x faster; this applies to every operation that sends a key
+  - Allocations per `get` hit drop from 23 to 16
+  - Thanks to Julian Richard Contreras for this contribution
+- Speed up multi-server `get_multi` by about 30% (4 servers, 100 keys), and bring small batches in line with 2.7.11 (#1161)
+  - Each server's queries and terminating noop are sent before the next server's are built, so memcached answers earlier servers while later ones are prepared
+  - A server's queries are built in one pass with `RequestFormatter.multi_meta_get`, and plain `get_multi` no longer requests the CAS value it discards (`get_multi_cas` still does)
+  - Pipelined replies are parsed in one pass over the returned flags
+  - Routing many keys checks each server's `alive?` once per call instead of twice per key, and the ring's binary search runs over plain integers
+  - Thanks to Julian Richard Contreras for this contribution
+
+Development:
+
+- Fix offenses reported by RuboCop 1.91 and require `rubocop >= 1.91` (#1162)
+  - RuboCop 1.91 adds `Style/DirectiveScope`; single-statement `disable`/`enable` pairs become `disable-next` directives, which older RuboCop versions do not recognize
+  - Removes a misplaced `# encoding: ascii` comment in `client.rb` that Ruby had always ignored
+
+5.1.0
+==========
+
+Features:
+
+- Add opaque routing tokens: `:p_token` and `:l_token` request options (#1147, #1154)
+  - `get`, `gat`, `get_cas`, `get_with_metadata`, `fetch_with_lock`, `set`/`add`/`replace`/`set_cas`/`replace_cas`, `append`/`prepend`, `incr`/`decr`, `cas`/`cas!`, `delete`/`delete_cas`, and the bulk operations (`get_multi`, `get_multi_cas`, `get_multi_with_metadata`, `set_multi`, `delete_multi`) all accept per-request `:p_token`/`:l_token` options, appended to the wire protocol as `P<token>`/`L<token>` -- applied to every key on the bulk methods
+  - memcached itself ignores these tokens; per the meta protocol spec they exist as hints for a proxy or router sitting between the client and memcached
+  - CRLF and NUL bytes raise `ArgumentError` before the request reaches the socket, both in `Dalli::Client` and in `RequestFormatter`, so a bad token can't be used for wire-protocol injection and can't close the connection out from under the caller the way a formatter-only check would
+  - The bulk methods and `delete`/`delete_cas` were deferred out of #1147 to avoid racing other in-flight PRs touching the same method signatures; #1154 completes them, including both the single-server fast path and the multi-server pipelined path for each
+  - Extracted from #1130; thanks to Nick Herson for the original idea and Jianbin Chen for porting it forward
+
+- Support tombstone (mark-stale) deletes on `delete`, `delete_cas`, and `delete_multi` (#1145, #1153)
+  - `:invalidate` marks the item stale instead of removing it, so `#get_with_metadata` / `#get_multi_with_metadata` report `stale: true` and a reader can tell "another process is repopulating this" apart from "this was never here" -- a tombstoned key is not a miss
+  - `:tombstone_ttl` controls how long the stale marker lives; requires `:invalidate`, since memcached only honors the TTL on a delete when it accompanies the invalidate flag
+  - `:drop_value` removes the item's value but leaves the item; on its own it is not a tombstone -- reads are an ordinary hit with an empty value
+  - `delete_multi` applies the same options to every key in the batch, on both the single-server and pipelined paths; its return value keeps counting keys the server found and acted on, so under `:invalidate` it reports how many keys were tombstoned rather than removed
+  - Extracted from #1130; thanks to Jianbin Chen for this contribution
+
+- Add `:miss` and `:return_ttl_remaining` to `get_with_metadata` (#1143)
+  - `:miss` is now always present in the returned Hash, distinguishing a true miss from a stored `nil` under `cache_nils` or a tombstoned, stale hit -- neither of which a `nil` `:value` alone can tell apart
+  - `:return_ttl_remaining` exposes the meta protocol's `t` flag as `:ttl_remaining` (seconds remaining, or `-1` for an item with no expiry), following the same opt-in shape as `:return_hit_status` / `:return_last_access`
+  - Extracted from #1130; thanks to Jianbin Chen for this contribution
+
+- Add `get_multi_with_metadata` for stale-aware bulk reads (#1144)
+  - Returns `{ key => { value:, cas:, stale:, miss: } }` for the keys that were found; genuine misses are omitted, matching `get_multi` / `get_multi_cas` -- a tombstoned item is a hit at the protocol level, so it is still returned, with `stale: true`
+  - Routes to the same single-server fast path / pipelined-getter split as `get_multi`
+  - Extracted from #1130; thanks to Jianbin Chen for this contribution
+
+Other changes:
+
+- Raise the documented minimum supported memcached version to 1.6.27 (#1140)
+  - Groundwork for the features above: `drop_value` tombstone deletes require 1.6.27, the highest floor of anything landing from #1130
+  - Not enforced at runtime -- `MIN_SUPPORTED_MEMCACHED_VERSION` only gates the test harness and the README's support statement, so this changes no running client's behavior
+
+Bug Fixes:
+
+- Retry a transient network error during a liveness check instead of treating it as terminal (#1150)
+  - `Dalli::Protocol::Base#alive?` caught any `NetworkError` -- including `RetryableNetworkError`, a subclass -- and unconditionally converted it to `false`, with no retry. This didn't match the retry-then-raise contract every other network-facing path in Dalli follows: a single transient connection hiccup during the liveness check itself (as opposed to an actual request) permanently reported a healthy server as down for that check
+  - Now retries once on `RetryableNetworkError`, letting `error_on_request!`'s own fail-count threshold decide when to actually give up (the same mechanism the rest of the codebase relies on): it keeps retrying until `socket_max_failures` is reached, then raises a terminal `NetworkError`, which is still converted to `false` as before
+  - **Behavior change:** a server that was previously marked "down" (engaging the `down_retry_delay` cooldown) only via an actual request could now also reach that state via a liveness check (`alive?`, and anything that calls it -- `Dalli::Client#stats`, `#reset_stats`, and `Ring`'s own server selection) exhausting its retries. Previously, a solitary transient failure during a liveness check was silently forgotten rather than tracked, so the cooldown was inconsistently applied depending on which code path first observed the failure
+  - Likely a contributing cause of the same intermittently failing `get_multi` failover integration test noted in #1149: that fix addressed the send/receive phase, but the liveness-check retry it introduced can itself force a fresh `connect()` mid-retry, giving this separate, pre-existing gap in `alive?` more chances to fire
+  - Also fixed a test (`test_ring.rb`, "detect when a dead server is up again") that had been unknowingly relying on the old behavior: it never engaged the `down_retry_delay` cooldown from a single transient failure, so its 0.5s delay never actually gated anything. Updated to use a 0s delay, since the test's intent is to verify reconnection is detected, not to test cooldown timing
+
+- Base64-encode keys containing control characters, not just NUL (#1148)
+  - `KeyRegularizer.required?` decided whether a key needed base64 encoding using `/\s/`, which matches most whitespace but none of the C0 control range (0x00-0x1F) or DEL (0x7F) -- a key that was otherwise ASCII-only and contained no whitespace (e.g. `"foo\x00bar"` or a key with an embedded ESC byte) went out on the wire unencoded
+  - Not a command-injection risk: the text protocol splits commands on CRLF, not other control bytes. The risk is key confusion -- anything downstream that treats one of these bytes specially (a C string terminating at NUL, a terminal or log line interpreting an escape byte) could silently act on a different key than Dalli believes it sent
+  - A raw control byte in a key was never protocol-compliant in the first place: memcached's own spec (`protocol.txt`) states a key "must not include control characters or whitespace." The only sanctioned way to carry such content in a key is the meta protocol's base64 (`b` flag) path -- the one whitespace and non-ASCII keys already used, and the one these keys now use too. The check is now `/[\p{Cntrl}\s]/`, matching that rule directly rather than special-casing NUL
+  - **Behavior change:** a key containing a control character now produces different bytes on the wire (base64-encoded, per the meta protocol's `b` flag) than before. Existing cache entries stored under the old, unencoded form of such a key will read as a miss once every reader has upgraded. **During a rolling deploy, old and new Dalli versions disagree about which physical key such a logical key maps to** -- not just a one-time cutover, but ongoing inconsistency between the old-version and new-version server pools for the duration of the rollout. Harmless for an ordinary cached value (worst case, extra cache misses); worth accounting for if such a key ever backs something stateful, like a lock or counter. Expected to be rare in practice: embedding a raw control byte in a cache key is unusual, and doing so was already outside what the protocol permits
+  - Found while auditing `request_formatter.rb` during the routing-token work in #1130 / #1147; unrelated to that change and predates it
+
+- Retry transient network errors in `get_multi`, `set_multi` and `delete_multi` instead of silently swallowing them (#1149)
+  - All three methods group keys by server and issue one request per server. Each per-server rescue clause caught `DalliError` and `NetworkError` together and swallowed both, just debug-logging -- since `RetryableNetworkError < NetworkError`, this also silently swallowed transient, retryable failures, dropping that server's keys from the result instead of the whole operation retrying (`get_multi`/`set_multi`'s single-server fast path did not even attempt a retry, on any failure)
+  - Six rescue sites across `PipelinedGetter`, `PipelinedSetter`, `PipelinedDeleter` and the `single_server_*` fast paths now retry a transient `RetryableNetworkError`, matching sibling rescue sites in the same files that already did this correctly
+  - **Behavior change:** if a server remains unreachable after retrying (not just a transient blip), these three methods now raise `Dalli::NetworkError` instead of silently returning an incomplete or empty result. This matches how every other Dalli::Client method already behaves on a hard network failure, and is the retry-then-raise behavior `delete_multi`'s own docs already described; it was just not reliably true for this failure path before. Code that calls these methods without rescuing `Dalli::NetworkError` should account for this if it can reach a fully unreachable server
+  - Likely the cause of an intermittently failing `get_multi` failover integration test that recurred across multiple PRs, though this could not be directly confirmed: the failure (an empty result with no exception in the logs) never reproduced locally despite repeated attempts, consistent with needing a genuine transient network hiccup that is far more likely on a loaded CI runner than an idle dev machine
+
+5.0.6
+==========
+
+Performance:
+
+- Skip the cas-return flag on quiet `meta_set` requests (#1131)
+  - In quiet mode memcached suppresses the `ms` response entirely, so the CAS requested by the `c` flag can never be read; sending it only added two bytes to every request
+  - Applies to the bulk-write paths, where quiet sets are emitted: `Dalli::Client#multi` blocks and the pipelined setter
+  - Extracted from #1130; thanks to Jianbin Chen for this contribution
+
+- Reduce allocations in `KeyRegularizer` and multi-key request paths (#1120)
+  - Decomposed `KeyRegularizer#encode` into separate `needs_encoding?` and `encode` calls so the common happy path avoids allocating an intermediate array for the two-element return value
+  - Refactored `multi_get`/`multi_set`/`multi_delete` command generation into `RequestFormatter` to share its key-encoding helpers
+  - Thanks to Jean Boussier for this contribution
+
+- Reduce allocations in `ResponseBuffer` pipelined getk parsing (#1117)
+  - `process_single_getk_response` was building a fresh array to return results alongside the updated offset; refactored to store the offset as the last element of the existing tokens array and pop it, saving one allocation per response
+  - Also skips trailing nils in the token array
+  - Thanks to Jean Boussier for this contribution
+
+- Enable frozen string literals in `RequestFormatter` (#1118)
+  - Frozen string literals had been inadvertently disabled; re-enabling reduces allocations by ~300,000 objects in a 10,000-iteration `get_multi_cas` benchmark (562 MB → 550 MB total allocated)
+  - Thanks to Jean Boussier for this contribution
+
+- Reduce allocations in `ResponseProcessor#value_from_tokens` (#1113)
+  - `token[1..].to_i` was allocating a new string for every token parsed; replaced with in-place `slice!` followed by a token reset to avoid poisoning subsequent token comparisons
+  - Saves 4 allocations per entry in `get_multi_cas` workloads (a hotspot for IdentityCache)
+  - Thanks to Jean Boussier for this contribution
+
+- Reduce allocations in common operation paths (#1111)
+  - Use `Symbol#name` over `Symbol#to_s` to return a frozen string without allocation
+  - Skip trace attribute hash construction when OpenTelemetry instrumentation is disabled
+  - Use argument forwarding (`...`) in `Client#perform` and `Threadsafe#request` to avoid splat array allocation
+  - Use `match?` in `KeyRegularizer#encode` to avoid `MatchData` object allocation
+  - Reduces objects allocated by ~26% and memory by ~6% for a simple `get` workload
+  - Thanks to Jean Boussier for this contribution
+
+- Fix pathological memory behavior in `ResponseBuffer` (#1114)
+  - `compact_if_needed` was intended to reclaim memory by slicing off consumed bytes, but `buffer.byteslice(@offset..)` on an unfrozen string causes Ruby to allocate a hidden third string as the copy-on-write owner rather than freeing the original
+  - Redesigns buffer management to pass reusable buffer objects directly to `read`/`read_nonblock`, avoiding reallocation on each response read
+  - Reduces allocations from ~2.38 GB to ~649 MB in a `get_multi_cas` benchmark over 10,000 iterations
+  - Accompanied by new unit tests for `ResponseBuffer` (#1115)
+  - Thanks to Jean Boussier for this contribution
+
+Features:
+
+- `delete_multi` now returns the number of keys found and deleted (#1126)
+  - Previously the return value was unspecified; callers (e.g. Rails, see rails/rails#58071) had no way to tell how many keys were actually removed
+  - The count is derived from the meta protocol's quiet-mode delete responses with no extra round-trips: successful deletes are suppressed while misses report `NF`, so any response received before the terminator is a key that was not deleted
+  - The single-server fast path now shares the pipelined path's bounded retry on transient (`RetryableNetworkError`) network errors, so both paths behave consistently; the returned count is best-effort and may under-report if a network error triggers a retry, since keys deleted before the error are not recounted
+  - Thanks to Iliana Hadzhiatanasova for this contribution
+
+Bug Fixes:
+
+- Raise instead of returning a truncated value when the peer closes mid-response (#1135)
+  - `IO#read(count)` on a blocking socket accumulates across TCP chunks and hands back a shorter buffer (or `nil`) in only one case: the stream hit EOF. That short buffer was passed through as the response body, so a memcached restart, proxy drop, or load balancer timeout partway through a response could surface a truncated but still decodable value to the caller, indistinguishable from a real one
+  - A short read is now treated as the premature EOF it is, raising and closing the dirty socket so the request is retried on a fresh connection
+  - CRuby only; the JRuby path already used `Socket#readfull`, which enforces the same contract
+  - Extracted from #1130; thanks to Ian Ker-Seymer for the original fix and Jianbin Chen for the port
+
+- Tear down the connection when a non-`StandardError` aborts a request (#1136)
+  - `Async::Stop` and `Thread#kill` descend from `Exception` rather than `StandardError`, so the rescue clauses in `Protocol::Base#request` never saw them; a scheduler cancelling a fiber parked on a response read skipped `close` entirely, leaving the connection marked as having a request in progress with partial response bytes still unread on the wire, and returning that half-used client to the pool under `connection_pool`
+  - `Protocol::Base#request` now closes in an `ensure` unless the request ran to completion, and `ConnectionManager#close` performs its state cleanup in an `ensure` so a second cancellation landing inside `@sock.close` cannot leave the socket non-nil with the request still marked in progress
+  - `Dalli::DalliError` and `Dalli::MarshalError` now close the connection at the point of failure rather than at the start of the next request; those paths already left the request in progress and `ConnectionManager#confirm_ready!` closed on the next call, so this changes when the close happens rather than adding one
+  - Extracted from #1130; thanks to Dan Mayer for the original fix and Jianbin Chen for the port
+
+- Fix `ResponseBuffer` compaction logic (#1119)
+  - `COMPACT_THRESHOLD` was removed in #1116 as apparently unused, but the constant was referenced by the compaction guard; its absence silently disabled buffer compaction
+  - Restored the constant, corrected the compaction condition, and improved the buffer-shrinking implementation to use `String#bytesplice` (backed by `memmove`) for true in-place compaction
+  - Adds targeted tests covering the compaction threshold and shrink behavior
+  - Thanks to Jean Boussier for this contribution
+
+Maintenance:
+
+- Scope `StrictWarnings` to Dalli's own source (#1134)
+  - The test suite runs under `-w` and prepends a hook to `Warning.singleton_class` that turns warnings into failures, but that hook is global: a warning emitted while loading any third-party gem aborted the whole suite before a single test ran
+  - `json` 2.21.2's pure-Ruby generator (used on JRuby, where the C extension is unavailable) warns `method redefined; discarding old to_hash` at require time, which took the `jruby-10` CI job red with no change to Dalli
+  - Warnings are now attributed to a source file and only raise for `lib/` and `test/`; attribution prefers the location Ruby embeds in the message, since the stack at that point describes the require chain rather than the offending code
+  - Portable attribution of `Kernel#warn` callers also required walking the stack rather than indexing it (Ruby 3.3/3.4 push an `<internal:warning>` frame that 4.0 does not), skipping RubyGems' `Kernel#warn` shim (active on JRuby but not CRuby), and resolving relative backtrace paths
+
+- Make raw and namespace fast path tests actually use those options (#1129)
+  - Followup to #1127: the `raw` and `namespace` variants passed those options to the helper that starts memcached, which configures the client the tests then discarded, so neither option was ever exercised
+  - Passes the options to the client under test and adds assertions that fail if they are absent
+  - Thanks to Iliana Hadzhiatanasova for this contribution
+
+- Benchmark `set_multi` and add a `delete_multi` target (#1132)
+  - Enables the two `set_multi` reports that were commented out pending the arrival of `set_multi`, resolving the accompanying TODO
+  - Adds a `delete_multi` target comparing the pipelined path against N single deletes
+  - Extracted from #1130; thanks to Jianbin Chen for this contribution
+
+- Bump CI memcached to 1.6.41 and run benchmarks on pull requests (#1133)
+  - The tests workflow moves from 1.6.40 to 1.6.41; the benchmarks and profile workflows had drifted back on 1.6.23
+  - Extracted from #1130; thanks to Jianbin Chen for this contribution
+
+- Disable RuboCop metrics cops (#1128)
+  - Thanks to Jean Boussier for this contribution
+
+- Remove `PIDCache` module (#1125)
+  - `Process.pid` is cached natively by Ruby 3.3+ (via https://bugs.ruby-lang.org/issues/19443), making the manual cache unnecessary now that Dalli requires Ruby 3.3+
+  - Thanks to Jean Boussier for this contribution
+
+- Remove unused `COMPACT_THRESHOLD` constant from `ResponseBuffer` (#1116)
+  - Followup cleanup after the buffer management redesign in #1114
+  - Note: subsequently found to be in use; restored and corrected in #1119
+  - Thanks to Jean Boussier for this contribution
+
+- Use `String#byteindex` instead of `String#index` when searching for the response terminator in `getk_response_from_buffer` (#1112)
+  - The result feeds directly into `byteslice`; `byteindex` makes the intent explicit, though both return the same value since the buffer encoding is always `BINARY`
+  - Thanks to Jean Boussier for this contribution
+
+- Make single-server fast path tests actually exercise the fast path (#1127)
+  - The batch-operation tests built clients through a helper that registers two address aliases for the same memcached process, so every client had a 2-server ring and the tests always ran through the pipelined path instead of the single-server fast path
+  - Adds a `single_server_client` test helper that builds a client with a single address, and uses it in the affected `get_multi`, `set_multi`, and `delete_multi` tests
+  - Thanks to Iliana Hadzhiatanasova for this contribution
+
+5.0.5
+==========
+
+Performance:
+
+- Batch multi-key commands into a single write to reduce packet overhead (#1107)
+  - With `TCP_NODELAY` set on sockets, each `write` call emits a separate packet; the meta protocol was calling `write` up to 3 times per key in multi-key operations (`get_multi`, `set_multi`, `delete_multi`), significantly increasing network traffic compared to the old binary protocol
+  - Multi-key request paths now buffer all per-key commands into a single binary string and flush once; single-key paths combine the write and flush into one `flushed_write` call
+  - Thanks to Jean Boussier for this contribution
+
+- Avoid repeated `RUBY_ENGINE` checks on every socket read (#1103)
+  - Moved the JRuby branch from a runtime `if` inside `ConnectionManager#read` to a class-level conditional method definition, so the check happens once at load time rather than on every read call
+  - Thanks to Jean Boussier for this contribution
+
+- Eliminate per-call array allocations in `ResponseProcessor` (#1104)
+  - Token sets passed to `error_on_unexpected!` (e.g. `[VA, EN, HD]`) were allocated as new arrays on every invocation; replaced with frozen constants defined once at class load time
+  - Thanks to Jean Boussier for this contribution
+
+- Avoid string copies when building request commands in `RequestFormatter` (#1106)
+  - Changed `cmd + TERMINATOR` to `cmd << TERMINATOR`; since `cmd` is always a mutable string, the in-place append avoids copying the entire command string just to append two bytes
+  - Thanks to Jean Boussier for this contribution
+
+5.0.4
+==========
+
+Bug fixes:
+
+- Fix `string_fastpath` flag collision with compression (#1099)
+  - `ValueSerializer::FLAG_UTF8` and `ValueCompressor::FLAG_COMPRESSED` were both `0x2`, causing `Dalli::UnmarshalError` on any UTF-8 string written with `string_fastpath: true` when compression is enabled, and silent encoding corruption for binary strings
+  - Introduces `Dalli::Flags` to centralise bit flag constants; UTF8 is reassigned to `0x4`
+  - Adds regression test covering short/long UTF-8, binary, and cross-client read scenarios
+  - Thanks to Jean Boussier and Mikael Henriksson for the fix and regression test
+
+- Fix client-level `string_fastpath: true` being silently ignored (#1101)
+  - `Dalli::Client.new(servers, string_fastpath: true)` had no effect; the fast path was only taken when `string_fastpath: true` was passed as a per-request option on each `set` call
+  - Per-request option continues to take precedence over the client-level setting in both directions
+
+5.0.3
+==========
+
+Performance:
+
+- Eliminate double array allocation in `Client#perform` (#1093)
+  - Changed method signature from `perform(*all_args)` with destructuring to `perform(op, key, *args)`, letting Ruby decompose arguments directly without intermediate array allocations
+  - Reduces benchmark time by ~39% across all Dalli operations (get, set, delete, etc.)
+  - Thanks to Sam Obeid for this contribution
+
+Features:
+
+- Support `connect_timeout:` keyword argument with `resolv-replace` >= 0.2.0, which now correctly forwards keyword arguments through its `TCPSocket` patch (#1096)
+
+- Add `Dalli::Instrumentation.disable!` to allow disabling OpenTelemetry instrumentation at runtime (#1088)
+  - Also exposes `Dalli::Instrumentation.tracer=` for setting a custom tracer
+
+5.0.2
+==========
+
+Performance:
+
+- Add single-server fast path for `get_multi`, `set_multi`, and `delete_multi` (#1077)
+  - When only one memcached server is configured, bypass the `Pipelined*` machinery (IO.select, response buffering, server grouping) and issue all quiet meta requests inline followed by a noop terminator
+  - `get_multi` shows ~1.5x improvement at 10 keys and ~1.75x at 100–500 keys compared to the `PipelinedGetter` path
+  - Thanks to Dan Mayer (Shopify) for this contribution
+
+Development:
+
+- Add `bin/benchmark_branch` script for benchmarking against the current branch
+
+5.0.1
+==========
+
+Performance:
+
+- Reduce object allocations in pipelined get response processing (#1072, #1078)
+  - Offset-based `ResponseBuffer`: track a read offset instead of slicing a new string after every parsed response; compact only when the consumed portion exceeds 4KB and more than half the buffer
+  - Inline response processor parsing: avoid intermediate array allocations from `split`-based header parsing
+  - Block-based `pipeline_next_responses`: yield `(key, value, cas)` directly when a block is given, avoiding per-call Hash allocation
+  - `PipelinedGetter`: replace Hash-based socket-to-server mapping with linear scan (faster for typical 1-5 server counts); use `Process.clock_gettime(CLOCK_MONOTONIC)` instead of `Time.now`
+- Add cross-version benchmark script (`bin/compare_versions`) for reproducible performance comparisons across Dalli versions
+
+Bug Fixes:
+
+- Rescue `IOError` in connection manager `write`/`flush` methods (#1075)
+  - Prevents unhandled exceptions when a connection is closed mid-operation
+  - Thanks to Graham Cooper (Shopify) for this fix
+
+Development:
+
+- Add `rubocop-thread_safety` for detecting thread-safety issues (#1076)
+- Add CONTRIBUTING.md with AI contribution policy (#1074)
+
+5.0.0
+==========
+
+**Breaking Changes:**
+
+- **Removed binary protocol** - The meta protocol is now the only supported protocol
+  - The `:protocol` option is no longer used
+  - Requires memcached 1.6+ (for meta protocol support)
+  - Users on older memcached versions must upgrade or stay on Dalli 4.x
+
+- **Removed SASL authentication** - The meta protocol does not support authentication
+  - Use network-level security (firewall rules, VPN) or memcached's TLS support instead
+  - Users requiring SASL authentication must stay on Dalli 4.x with binary protocol
+
+- **Ruby 3.3+ required** - Dropped support for Ruby 3.1 and 3.2
+  - Ruby 3.2 reached end-of-life in March 2026
+  - JRuby remains supported
+
+Performance:
+
+- **~7% read performance improvement** (CRuby only)
+  - Use native `IO#read` instead of custom `readfull` implementation
+  - Enabled by Ruby 3.3's `IO#timeout=` support
+  - JRuby continues to use `readfull` for compatibility
+
+OpenTelemetry:
+
+- Migrate to stable OTel semantic conventions (#1070)
+  - `db.system` renamed to `db.system.name`
+  - `db.operation` renamed to `db.operation.name`
+  - `server.address` now contains hostname only; `server.port` is a separate integer attribute
+  - `get_with_metadata` and `fetch_with_lock` now include `server.address`/`server.port`
+- Add `db.query.text` span attribute with configurable modes
+  - `:otel_db_statement` option: `:include`, `:obfuscate`, or `nil` (default: omitted)
+- Add `peer.service` span attribute
+  - `:otel_peer_service` option for logical service naming
+
+Internal:
+
+- Simplified protocol directory structure: moved `lib/dalli/protocol/meta/*` to `lib/dalli/protocol/`
+- Removed deprecated binary protocol files and SASL authentication code
+- Removed `require 'set'` (autoloaded in Ruby 3.3+)
+
+4.3.3
+==========
+
+Performance:
+
+- Reduce object allocations in pipelined get response processing (#1072)
+  - Offset-based `ResponseBuffer`: track a read offset instead of slicing a new string after every parsed response; compact only when the consumed portion exceeds 4KB and more than half the buffer
+  - Inline response processor parsing: avoid intermediate array allocations from `split`-based header parsing in both binary and meta protocols
+  - Block-based `pipeline_next_responses`: yield `(key, value, cas)` directly when a block is given, avoiding per-call Hash allocation
+  - `PipelinedGetter`: replace Hash-based socket-to-server mapping with linear scan (faster for typical 1-5 server counts); use `Process.clock_gettime(CLOCK_MONOTONIC)` instead of `Time.now`
+- Add cross-version benchmark script (`bin/compare_versions`) for reproducible performance comparisons across Dalli versions
+
+Bug Fixes:
+
+- Skip OTel integration tests when meta protocol is unavailable (#1072)
+
+4.3.2
+==========
+
+OpenTelemetry:
+
+- Migrate to stable OTel semantic conventions
+  - `db.system` renamed to `db.system.name`
+  - `db.operation` renamed to `db.operation.name`
+  - `server.address` now contains hostname only; `server.port` is a separate integer attribute
+  - `get_with_metadata` and `fetch_with_lock` now include `server.address`/`server.port`
+- Add `db.query.text` span attribute with configurable modes
+  - `:otel_db_statement` option: `:include`, `:obfuscate`, or `nil` (default: omitted)
+- Add `peer.service` span attribute
+  - `:otel_peer_service` option for logical service naming
+
+4.3.1
+==========
+
+Bug Fixes:
+
+- Fix socket compatibility with gems that monkey-patch TCPSocket (#996, #1012)
+  - Gems like `socksify` and `resolv-replace` modify `TCPSocket#initialize`, breaking Ruby 3.0+'s `connect_timeout:` keyword argument
+  - Detection now uses parameter signature checking instead of gem-specific method detection
+  - Falls back to `Timeout.timeout` when monkey-patching is detected
+  - Detection result is cached for performance
+
+- Fix network retry bug with `socket_max_failures: 0` (#1065)
+  - Previously, setting `socket_max_failures: 0` could still cause retries due to error handling
+  - Introduced `RetryableNetworkError` subclass to distinguish retryable vs non-retryable errors
+  - `down!` now raises non-retryable `NetworkError`, `reconnect!` raises `RetryableNetworkError`
+  - Thanks to Graham Cooper (Shopify) for this fix
+
+- Fix "character class has duplicated range" Ruby warning (#1067)
+  - Fixed regex in `KeyManager::VALID_NAMESPACE_SEPARATORS` that caused warnings on newer Ruby versions
+  - Thanks to Hartley McGuire for this fix
+
+Improvements:
+
+- Add StrictWarnings test helper to catch Ruby warnings early (#1067)
+
+- Use bulk attribute setter for OpenTelemetry spans (#1068)
+  - Reduces lock acquisitions when setting span attributes
+  - Thanks to Robert Laurin (Shopify) for this optimization
+
+- Fix double recording of exceptions on OpenTelemetry spans (#1069)
+  - OpenTelemetry's `in_span` method already records exceptions and sets error status automatically
+  - Removed redundant explicit exception recording that caused exceptions to appear twice in traces
+  - Thanks to Robert Laurin (Shopify) for this fix
+
+4.3.0
+==========
+
+New Features:
+
+- Add `namespace_separator` option to customize the separator between namespace and key (#1019)
+  - Default is `:` for backward compatibility
+  - Must be a single non-alphanumeric character (e.g., `:`, `/`, `|`, `.`)
+  - Example: `Dalli::Client.new(servers, namespace: 'myapp', namespace_separator: '/')`
+
+Bug Fixes:
+
+- Fix architecture-dependent struct timeval packing for socket timeouts (#1034)
+  - Detects correct pack format for time_t and suseconds_t on each platform
+  - Fixes timeout issues on architectures with 64-bit time_t
+
+- Fix get_multi hanging with large key counts (#776, #941)
+  - Add interleaved read/write for pipelined gets to prevent socket buffer deadlock
+  - For batches over 10,000 keys per server, requests are now sent in chunks
+
+- **Breaking:** Enforce string-only values in raw mode (#1022)
+  - `set(key, nil, raw: true)` now raises `MarshalError` instead of storing `""`
+  - `set(key, 123, raw: true)` now raises `MarshalError` instead of storing `"123"`
+  - This matches the behavior of client-level `raw: true` mode
+  - To store counters, use string values: `set('counter', '0', raw: true)`
+
+CI:
+
+- Add TruffleRuby to CI test matrix (#988)
+
+4.2.0
+==========
+
+Performance:
+
+- Buffered I/O: Use `socket.sync = false` with explicit flush to reduce syscalls for pipelined operations
+- get_multi optimizations: Use Set for O(1) server tracking lookups
+- Raw mode optimization: Skip bitflags request in meta protocol when in raw mode (saves 2 bytes per request)
+
+New Features:
+
+- OpenTelemetry tracing support: Automatically instruments operations when OpenTelemetry SDK is present
+  - Zero overhead when OpenTelemetry is not loaded
+  - Traces `get`, `set`, `delete`, `get_multi`, `set_multi`, `delete_multi`, `get_with_metadata`, and `fetch_with_lock`
+  - Spans include `db.system: memcached` and `db.operation` attributes
+  - Single-key operations include `server.address` attribute
+  - Multi-key operations include `db.memcached.key_count` attribute
+  - `get_multi` spans include `db.memcached.hit_count` and `db.memcached.miss_count` for cache efficiency metrics
+  - Exceptions are automatically recorded on spans with error status
+
+4.1.0
+==========
+
+New Features:
+
+- Add `set_multi` for efficient bulk set operations using pipelined requests
+- Add `delete_multi` for efficient bulk delete operations using pipelined requests
+- Add `fetch_with_lock` for thundering herd protection using meta protocol's vivify/recache flags (requires memcached 1.6+)
+- Add thundering herd protection support to meta protocol (requires memcached 1.6+):
+  - `N` (vivify) flag for creating stubs on cache miss
+  - `R` (recache) flag for winning recache race when TTL is below threshold
+  - Response flags `W` (won recache), `X` (stale), `Z` (lost race)
+  - `delete_stale` method for marking items as stale instead of deleting
+- Add `get_with_metadata` for advanced cache operations with metadata retrieval (requires memcached 1.6+):
+  - Returns hash with `:value`, `:cas`, `:won_recache`, `:stale`, `:lost_recache`
+  - Optional `:return_hit_status` returns `:hit_before` (true/false for previous access)
+  - Optional `:return_last_access` returns `:last_access` (seconds since last access)
+  - Optional `:skip_lru_bump` prevents LRU update on access
+  - Optional `:vivify_ttl` and `:recache_ttl` for thundering herd protection
+
+Deprecations:
+
+- Binary protocol is deprecated and will be removed in Dalli 5.0. Use `protocol: :meta` instead (requires memcached 1.6+)
+- SASL authentication is deprecated and will be removed in Dalli 5.0. Consider using network-level security or memcached's TLS support
+
+4.0.1
+==========
+
+- Add `:raw` client option to skip serialization entirely, returning raw byte strings
+- Handle `OpenSSL::SSL::SSLError` in connection manager
+
+4.0.0
+==========
+
+BREAKING CHANGES:
+
+- Require Ruby 3.1+ (dropped support for Ruby 2.6, 2.7, and 3.0)
+- Removed `Dalli::Server` deprecated alias - use `Dalli::Protocol::Binary` instead
+- Removed `:compression` option - use `:compress` instead
+- Removed `close_on_fork` method - use `reconnect_on_fork` instead
+
+Other changes:
+
+- Add security warning when using default Marshal serializer (silence with `silence_marshal_warning: true`)
+- Add defense-in-depth input validation for stats command arguments
+- Add `string_fastpath` option to skip serialization for simple strings (byroot)
+- Meta protocol set performance improvement (danmayer)
+- Fix connection_pool 3.0 compatibility for Rack session store
+- Fix session recovery after deletion (stengineering0)
+- Fix cannot read response data included terminator `\r\n` when use meta protocol (matsubara0507)
+- Support SERVER_ERROR response from Memcached as per the [memcached spec](https://github.com/memcached/memcached/blob/e43364402195c8e822bb8f88755a60ab8bbed62a/doc/protocol.txt#L172) (grcooper)
+- Update Socket timeout handling to use Socket#timeout= when available (nickamorim)
+- Serializer: reraise all .load errors as UnmarshalError (olleolleolle)
+- Reconnect gracefully when a fork is detected instead of crashing (PatrickTulskie)
+- Update CI to test against memcached 1.6.40
+
+3.2.8
+==========
+
+- Handle IO::TimeoutError when establishing connection (eugeneius)
+- Drop dependency on base64 gem (Earlopain)
+- Address incompatibility with resolv-replace (y9v)
+- Add rubygems.org metadata (m-nakamura145)
+
+3.2.7
+==========
+
+- Fix cascading error when there's an underlying network error in a pipelined get (eugeneius)
+- Ruby 3.4/head compatibility by adding base64 to gemspec (tagliala)
+- Add Ruby 3.3 to CI (m-nakamura145)
+- Use Socket's connect_timeout when available, and pass timeout to the socket's send and receive timeouts (mlarraz)
+
+3.2.6
+==========
+
+- Rescue IO::TimeoutError raised by Ruby since 3.2.0 on blocking reads/writes (skaes)
+- Fix rubydoc link (JuanitoFatas)
+
+3.2.5
+==========
+
+- Better handle memcached requests being interrupted by Thread#raise or Thread#kill (byroot)
+- Unexpected errors are no longer treated as `Dalli::NetworkError`, including errors raised by `Timeout.timeout` (byroot)
+
+3.2.4
+==========
+
+- Cache PID calls for performance since glibc no longer caches in recent versions (byroot)
+- Preallocate the read buffer in Socket#readfull (byroot)
+
+3.2.3
+==========
+
+- Sanitize CAS inputs to ensure additional commands are not passed to memcached (xhzeem / petergoldstein)
+- Sanitize input to flush command to ensure additional commands are not passed to memcached (xhzeem / petergoldstein)
+- Namespaces passed as procs are now evaluated every time, as opposed to just on initialization (nrw505)
+- Fix missing require of uri in ServerConfigParser (adam12)
+- Fix link to the CHANGELOG.md file in README.md (rud)
+
+3.2.2
+==========
+
+- Ensure apps are resilient against old session ids (kbrock)
+
+3.2.1
+==========
+
+- Fix null replacement bug on some SASL-authenticated services (veritas1)
+
+3.2.0
+==========
+
+- BREAKING CHANGE: Remove protocol_implementation client option (petergoldstein)
+- Add protocol option with meta implementation (petergoldstein)
+
+3.1.6
+==========
+
+- Fix bug with cas/cas! with "Not found" value (petergoldstein)
+- Add Ruby 3.1 to CI (petergoldstein)
+- Replace reject(&:nil?) with compact (petergoldstein)
+
+3.1.5
+==========
+
+- Fix bug with get_cas key with "Not found" value (petergoldstein)
+- Replace should return nil, not raise error, on miss (petergoldstein)
+
+3.1.4
+==========
+
+- Improve response parsing performance (byroot)
+- Reorganize binary protocol parsing a bit (petergoldstein)
+- Fix handling of non-ASCII keys in get_multi (petergoldstein)
+
+3.1.3
+==========
+
+- Restore falsey behavior on delete/delete_cas for nonexistent key (petergoldstein)
+
+3.1.2
+==========
+
+- Make quiet? / multi? public on Dalli::Protocol::Binary (petergoldstein)
+
+3.1.1
+==========
+
+- Add quiet support for incr, decr, append, depend, and flush (petergoldstein)
+- Additional refactoring to allow reuse of connection behavior (petergoldstein)
+- Fix issue in flush such that it wasn't passing the delay argument to memcached (petergoldstein)
+
+3.1.0
+==========
+
+- BREAKING CHANGE: Update Rack::Session::Dalli to inherit from Abstract::PersistedSecure.  This will invalidate existing sessions (petergoldstein)
+- BREAKING CHANGE: Use of unsupported operations in a multi block now raise an error. (petergoldstein)
+- Extract PipelinedGetter from Dalli::Client (petergoldstein)
+- Fix SSL socket so that it works with pipelined gets (petergoldstein)
+- Additional refactoring to split classes (petergoldstein)
+
+3.0.6
+==========
+
+- Fix regression in SASL authentication response parsing (petergoldstein)
+
+3.0.5
+==========
+
+- Add Rubocop and fix most outstanding issues (petergoldstein)
+- Extract a number of classes, to simplify the largest classes (petergoldstein)
+- Ensure against socket corruption if an error occurs in a multi block (petergoldstein)
+
+3.0.4
+==========
+
+- Clean connections and retry after NetworkError in get_multi (andrejbl)
+- Internal refactoring and cleanup (petergoldstein)
+
+3.0.3
+==========
+
+- Restore ability for `compress` to be disabled on a per request basis (petergoldstein)
+- Fix broken image in README (deining)
+- Use bundler-cache in CI (olleolleolle)
+- Remove the OpenSSL extensions dependency (petergoldstein)
+- Add Memcached 1.5.x to the CI matrix
+- Updated compression documentation (petergoldstein)
+
+3.0.2
+==========
+
+- Restore Windows compatibility (petergoldstein)
+- Add JRuby to CI and make requisite changes (petergoldstein)
+- Clarify documentation for supported rubies (petergoldstein)
+
+3.0.1
+==========
+
+- Fix syntax error that prevented inclusion of Dalli::Server (ryanfb)
+- Restore with method required by ActiveSupport::Cache::MemCacheStore
+
+3.0.0
+==========
+- BREAKING CHANGES:
+
+  * Removes :dalli_store.
+    Use Rails' official :mem_cache_store instead.
+    https://guides.rubyonrails.org/caching_with_rails.html
+  * Attempting to store a larger value than allowed by memcached used to
+    print a warning and truncate the value. This now raises an error to
+    prevent silent data corruption.
+  * Compression now defaults to `true` for large values (greater than 4KB).
+    This is intended to minimize errors due to the previous note.
+  * Errors marshalling values now raise rather than just printing an error.
+  * The Rack session adapter has been refactored to remove support for thread-unsafe
+    configurations. You will need to include the `connection_pool` gem in
+    your Gemfile to ensure session operations are thread-safe.
+  * When using namespaces, the algorithm for calculating truncated keys was
+    changed.  Non-truncated keys and truncated keys for the non-namespace
+    case were left unchanged.
+
+- Raise NetworkError when multi response gets into corrupt state (mervync, #783)
+- Validate servers argument (semaperepelitsa, petergoldstein, #776)
+- Enable SSL support (bdunne, #775)
+- Add gat operation (tbeauvais, #769)
+- Removes inline native code, use Ruby 2.3+ support for bsearch instead. (mperham)
+- Switch repo to Github Actions and upgrade Ruby versions (petergoldstein, bdunne, Fryguy)
+- Update benchmark test for Rubyprof changes (nateberkopec)
+- Remove support for the `kgio` gem, it is not relevant in Ruby 2.3+. (mperham)
+- Remove inline native code, use Ruby 2.3+ support for bsearch instead. (mperham)
+
+
+2.7.11
+==========
+- DEPRECATION: :dalli_store will be removed in Dalli 3.0.
+  Use Rails' official :mem_cache_store instead.
+  https://guides.rubyonrails.org/caching_with_rails.html
+- Add new `digest_class` option to Dalli::Client [#724]
+- Don't treat NameError as a network error [#728]
+- Handle nested comma separated server strings (sambostock)
+
+2.7.10
+==========
+- Revert frozen string change (schneems)
+- Advertise supports_cached_versioning? in DalliStore (schneems)
+- Better detection of fork support, to allow specs to run under Truffle Ruby (deepj)
+- Update logging for over max size to log as error (aeroastro)
+
+2.7.9
+==========
+- Fix behavior for Rails 5.2+ cache_versioning (GriwMF)
+- Ensure fetch provides the key to the fallback block as an argument (0exp)
+- Assorted performance improvements (schneems)
+
+2.7.8
+==========
+- Rails 5.2 compatibility (pbougie)
+- Fix Session Cache compatibility (pixeltrix)
+
+2.7.7
+==========
+- Support large cache keys on fetch multi (sobrinho)
+- Not found checks no longer trigger the result's equality method (dannyfallon)
+- Use SVG build badges (olleolleolle)
+- Travis updates (junaruga, tiarly, petergoldstein)
+- Update default down_retry_delay (jaredhales)
+- Close kgio socket after IO.select timeouts
+- Documentation updates (tipair)
+- Instrument DalliStore errors with instrument_errors configuration option. (btatnall)
+
+2.7.6
+==========
+- Rails 5.0.0.beta2 compatibility (yui-knk, petergoldstein)
+- Add cas!, a variant of the #cas method that yields to the block whether or not the key already exist (mwpastore)
+- Performance improvements (nateberkopec)
+- Add Ruby 2.3.0 to support matrix (tricknotes)
+
+2.7.5
+==========
+
+- Support rcvbuff and sndbuff byte configuration. (btatnall)
+- Add `:cache_nils` option to support nil values in `DalliStore#fetch` and `Dalli::Client#fetch` (wjordan, #559)
+- Log retryable server errors with 'warn' instead of 'info' (phrinx)
+- Fix timeout issue with Dalli::Client#get_multi_yielder (dspeterson)
+- Escape namespaces with special regexp characters (Steven Peckins)
+- Ensure LocalCache supports the `:raw` option and Entry unwrapping (sj26)
+- Ensure bad ttl values don't cause Dalli::RingError (eagletmt, petergoldstein)
+- Always pass namespaced key to instrumentation API (kaorimatz)
+- Replace use of deprecated TimeoutError with Timeout::Error (eagletmt)
+- Clean up gemspec, and use Bundler for loading (grosser)
+- Dry up local cache testing (grosser)
+
+2.7.4
+==========
+
+- Restore Windows compatibility (dfens, #524)
+
+2.7.3
+==========
+
+- Assorted spec improvements
+- README changes to specify defaults for failover and compress options (keen99, #470)
+- SASL authentication changes to deal with Unicode characters (flypiggy, #477)
+- Call to_i on ttl to accomodate ActiveSupport::Duration (#494)
+- Change to implicit blocks for performance (glaucocustodio, #495)
+- Change to each_key for performance (jastix, #496)
+- Support stats settings - (dterei, #500)
+- Raise DallError if hostname canno be parsed (dannyfallon, #501)
+- Fix instrumentation for falsey values (AlexRiedler, #514)
+- Support UNIX socket configurations (r-stu31, #515)
+
+2.7.2
+==========
+
+- The fix for #423 didn't make it into the released 2.7.1 gem somehow.
+
+2.7.1
+==========
+
+- Rack session will check if servers are up on initialization (arthurnn, #423)
+- Add support for IPv6 addresses in hex form, ie: "[::1]:11211" (dplummer, #428)
+- Add symbol support for namespace (jingkai #431)
+- Support expiration intervals longer than 30 days (leonid-shevtsov #436)
+
+2.7.0
+==========
+
+- BREAKING CHANGE:
+  Dalli::Client#add and #replace now return a truthy value, not boolean true or false.
+- Multithreading support with dalli\_store:
+  Use :pool\_size to create a pool of shared, threadsafe Dalli clients in Rails:
+```ruby
+    config.cache_store = :dalli_store, "cache-1.example.com", "cache-2.example.com", :compress => true, :pool_size => 5, :expires_in => 300
+```
+  This will ensure the Rails.cache singleton does not become a source of contention.
+  **PLEASE NOTE** Rails's :mem\_cache\_store does not support pooling as of
+Rails 4.0.  You must use :dalli\_store.
+
+- Implement `version` for retrieving version of connected servers [dterei, #384]
+- Implement `fetch_multi` for batched read/write [sorentwo, #380]
+- Add more support for safe updates with multiple writers: [philipmw, #395]
+  `require 'dalli/cas/client'` augments Dalli::Client with the following methods:
+  * Get value with CAS:            `[value, cas] = get_cas(key)`
+                                   `get_cas(key) {|value, cas| ...}`
+  * Get multiple values with CAS:  `get_multi_cas(k1, k2, ...) {|value, metadata| cas = metadata[:cas]}`
+  * Set value with CAS:            `new_cas = set_cas(key, value, cas, ttl, options)`
+  * Replace value with CAS:        `replace_cas(key, new_value, cas, ttl, options)`
+  * Delete value with CAS:         `delete_cas(key, cas)`
+- Fix bug with get key with "Not found" value [uzzz, #375]
+
+2.6.4
+=======
+
+- Fix ADD command, aka `write(unless_exist: true)` (pitr, #365)
+- Upgrade test suite from mini\_shoulda to minitest.
+- Even more performance improvements for get\_multi (xaop, #331)
+
+2.6.3
+=======
+
+- Support specific stats by passing `:items` or `:slabs` to `stats` method [bukhamseen]
+- Fix 'can't modify frozen String' errors in `ActiveSupport::Cache::DalliStore` [dblock]
+- Protect against objects with custom equality checking [theron17]
+- Warn if value for key is too large to store [locriani]
+
+2.6.2
+=======
+
+- Properly handle missing RubyInline
+
+2.6.1
+=======
+
+- Add optional native C binary search for ring, add:
+
+gem 'RubyInline'
+
+  to your Gemfile to get a 10% speedup when using many servers.
+  You will see no improvement if you are only using one server.
+
+- More get_multi performance optimization [xaop, #315]
+- Add lambda support for cache namespaces [joshwlewis, #311]
+
+2.6.0
+=======
+
+- read_multi optimization, now checks local_cache [chendo, #306]
+- Re-implement get_multi to be non-blocking [tmm1, #295]
+- Add `dalli` accessor to dalli_store to access the underlying
+Dalli::Client, for things like `get_multi`.
+- Add `Dalli::GzipCompressor`, primarily for compatibility with nginx's HttpMemcachedModule using `memcached_gzip_flag`
+
+2.5.0
+=======
+
+- Don't escape non-ASCII keys, memcached binary protocol doesn't care. [#257]
+- :dalli_store now implements LocalCache [#236]
+- Removed lots of old session_store test code, tests now all run without a default memcached server [#275]
+- Changed Dalli ActiveSupport adapter to always attempt instrumentation [brianmario, #284]
+- Change write operations (add/set/replace) to return false when value is too large to store [brianmario, #283]
+- Allowing different compressors per client [naseem]
+
+2.4.0
+=======
+- Added the ability to swap out the compressed used to [de]compress cache data [brianmario, #276]
+- Fix get\_multi performance issues with lots of memcached servers [tmm1]
+- Throw more specific exceptions [tmm1]
+- Allowing different types of serialization per client [naseem]
+
+2.3.0
+=======
+- Added the ability to swap out the serializer used to [de]serialize cache data [brianmario, #274]
+
+2.2.1
+=======
+
+- Fix issues with ENV-based connections. [#266]
+- Fix problem with SessionStore in Rails 4.0 [#265]
+
+2.2.0
+=======
+
+- Add Rack session with\_lock helper, for Rails 4.0 support [#264]
+- Accept connection string in the form of a URL (e.g., memcached://user:pass@hostname:port) [glenngillen]
+- Add touch operation [#228, uzzz]
+
+2.1.0
+=======
+
+- Add Railtie to auto-configure Dalli when included in Gemfile [#217, steveklabnik]
+
+2.0.5
+=======
+
+- Create proper keys for arrays of objects passed as keys [twinturbo, #211]
+- Handle long key with namespace [#212]
+- Add NODELAY to TCP socket options [#206]
+
+2.0.4
+=======
+
+- Dalli no longer needs to be reset after Unicorn/Passenger fork [#208]
+- Add option to re-raise errors rescued in the session and cache stores. [pitr, #200]
+- DalliStore#fetch called the block if the cached value == false [#205]
+- DalliStore should have accessible options [#195]
+- Add silence and mute support for DalliStore [#207]
+- Tracked down and fixed socket corruption due to Timeout [#146]
+
+2.0.3
+=======
+
+- Allow proper retrieval of stored `false` values [laserlemon, #197]
+- Allow non-ascii and whitespace keys, only the text protocol has those restrictions [#145]
+- Fix DalliStore#delete error-handling [#196]
+
+2.0.2
+=======
+
+- Fix all dalli\_store operations to handle nil options [#190]
+- Increment and decrement with :initial => nil now return nil (lawrencepit, #112)
+
+2.0.1
+=======
+
+- Fix nil option handling in dalli\_store#write [#188]
+
+2.0.0
+=======
+
+- Reimplemented the Rails' dalli\_store to remove use of
+  ActiveSupport::Cache::Entry which added 109 bytes overhead to every
+  value stored, was a performance bottleneck and duplicated a lot of
+  functionality already in Dalli.  One benchmark went from 4.0 sec to 3.0
+  sec with the new dalli\_store. [#173]
+- Added reset\_stats operation [#155]
+- Added support for configuring keepalive on TCP connections to memcached servers (@bianster, #180)
+
+Notes:
+
+  * data stored with dalli\_store 2.x is NOT backwards compatible with 1.x.
+    Upgraders are advised to namespace their keys and roll out the 2.x
+    upgrade slowly so keys do not clash and caches are warmed.
+    `config.cache_store = :dalli_store, :expires_in => 24.hours.to_i, :namespace => 'myapp2'`
+  * data stored with plain Dalli::Client API is unchanged.
+  * removed support for dalli\_store's race\_condition\_ttl option.
+  * removed support for em-synchrony and unix socket connection options.
+  * removed support for Ruby 1.8.6
+  * removed memcache-client compability layer and upgrade documentation.
+
+
+1.1.5
+=======
+
+- Coerce input to incr/decr to integer via #to\_i [#165]
+- Convert test suite to minitest/spec (crigor, #166)
+- Fix encoding issue with keys [#162]
+- Fix double namespacing with Rails and dalli\_store. [#160]
+
+1.1.4
+=======
+
+- Use 127.0.0.1 instead of localhost as default to avoid IPv6 issues
+- Extend DalliStore's :expires\_in when :race\_condition\_ttl is also used.
+- Fix :expires\_in option not propogating from DalliStore to Client, GH-136
+- Added support for native Rack session store.  Until now, Dalli's
+  session store has required Rails.  Now you can use Dalli to store
+  sessions for any Rack application.
+
+    require 'rack/session/dalli'
+    use Rack::Session::Dalli, :memcache_server => 'localhost:11211', :compression => true
+
+1.1.3
+=======
+
+- Support Rails's autoloading hack for loading sessions with objects
+  whose classes have not be required yet, GH-129
+- Support Unix sockets for connectivity.  Shows a 2x performance
+  increase but keep in mind they only work on localhost. (dfens)
+
+1.1.2
+=======
+
+- Fix incompatibility with latest Rack session API when destroying
+  sessions, thanks @twinge!
+
+1.1.1
+=======
+
+v1.1.0 was a bad release.  Yanked.
+
+1.1.0
+=======
+
+- Remove support for Rails 2.3, add support for Rails 3.1
+- Fix socket failure retry logic, now you can restart memcached and Dalli won't complain!
+- Add support for fibered operation via em-synchrony (eliaslevy)
+- Gracefully handle write timeouts, GH-99
+- Only issue bug warning for unexpected StandardErrors, GH-102
+- Add travis-ci build support (ryanlecompte)
+- Gracefully handle errors in get_multi (michaelfairley)
+- Misc fixes from crash2burn, fphilipe, igreg, raggi
+
+1.0.5
+=======
+
+- Fix socket failure retry logic, now you can restart memcached and Dalli won't complain!
+
+1.0.4
+=======
+
+- Handle non-ASCII key content in dalli_store
+- Accept key array for read_multi in dalli_store
+- Fix multithreaded race condition in creation of mutex
+
+1.0.3
+=======
+
+- Better handling of application marshalling errors
+- Work around jruby IO#sysread compatibility issue
+
+
+1.0.2
+=======
+
+ - Allow browser session cookies (blindsey)
+ - Compatibility fixes (mwynholds)
+ - Add backwards compatibility module for memcache-client, require 'dalli/memcache-client'.  It makes
+   Dalli more compatible with memcache-client and prints out a warning any time you do something that
+   is no longer supported so you can fix your code.
+
+1.0.1
+=======
+
+ - Explicitly handle application marshalling bugs, GH-56
+ - Add support for username/password as options, to allow multiple bucket access
+   from the same Ruby process, GH-52
+ - Add support for >1MB values with :value_max_bytes option, GH-54 (r-stu31)
+ - Add support for default TTL, :expires_in, in Rails 2.3. (Steven Novotny)
+   config.cache_store = :dalli_store, 'localhost:11211', {:expires_in => 4.hours}
+
+
+1.0.0
+=======
+
+Welcome gucki as a Dalli committer!
+
+ - Fix network and namespace issues in get_multi (gucki)
+ - Better handling of unmarshalling errors (mperham)
+
+0.11.2
+=======
+
+ - Major reworking of socket error and failover handling (gucki)
+ - Add basic JRuby support (mperham)
+
+0.11.1
+======
+
+ - Minor fixes, doc updates.
+ - Add optional support for kgio sockets, gives a 10-15% performance boost.
+
+0.11.0
+======
+
+Warning: this release changes how Dalli marshals data.  I do not guarantee compatibility until 1.0 but I will increment the minor version every time a release breaks compatibility until 1.0.
+
+IT IS HIGHLY RECOMMENDED YOU FLUSH YOUR CACHE BEFORE UPGRADING.
+
+ - multi() now works reentrantly.
+ - Added new Dalli::Client option for default TTLs, :expires_in, defaults to 0 (aka forever).
+ - Added new Dalli::Client option, :compression, to enable auto-compression of values.
+ - Refactor how Dalli stores data on the server.  Values are now tagged
+   as "marshalled" or "compressed" so they can be automatically deserialized
+   without the client having to know how they were stored.
+
+0.10.1
+======
+
+ - Prefer server config from environment, fixes Heroku session store issues (thanks JoshMcKin)
+ - Better handling of non-ASCII values (size -> bytesize)
+ - Assert that keys are ASCII only
+
+0.10.0
+======
+
+Warning: this release changed how Rails marshals data with Dalli.  Unfortunately previous versions double marshalled values.  It is possible that data stored with previous versions of Dalli will not work with this version.
+
+IT IS HIGHLY RECOMMENDED YOU FLUSH YOUR CACHE BEFORE UPGRADING.
+
+ - Rework how the Rails cache store does value marshalling.
+ - Rework old server version detection to avoid a socket read hang.
+ - Refactor the Rails 2.3 :dalli\_store to be closer to :mem\_cache\_store.
+ - Better documentation for session store config (plukevdh)
+
+0.9.10
+----
+
+ - Better server retry logic (next2you)
+ - Rails 3.1 compatibility (gucki)
+
+
+0.9.9
+----
+
+ - Add support for *_multi operations for add, set, replace and delete.  This implements
+   pipelined network operations; Dalli disables network replies so we're not limited by
+   latency, allowing for much higher throughput.
+
+    dc = Dalli::Client.new
+    dc.multi do
+      dc.set 'a', 1
+      dc.set 'b', 2
+      dc.set 'c', 3
+      dc.delete 'd'
+    end
+ - Minor fix to set the continuum sorted by value (kangster)
+ - Implement session store with Rails 2.3.  Update docs.
+
+0.9.8
+-----
+
+ - Implement namespace support
+ - Misc fixes
+
+
+0.9.7
+-----
+
+ - Small fix for NewRelic integration.
+ - Detect and fail on older memcached servers (pre-1.4).
+
+0.9.6
+-----
+
+ - Patches for Rails 3.0.1 integration.
+
+0.9.5
+-----
+
+ - Major design change - raw support is back to maximize compatibility with Rails
+ and the increment/decrement operations.  You can now pass :raw => true to most methods
+ to bypass (un)marshalling.
+ - Support symbols as keys (ddollar)
+ - Rails 2.3 bug fixes
+
+
+0.9.4
+-----
+
+ - Dalli support now in rack-bug (http://github.com/brynary/rack-bug), give it a try!
+ - Namespace support for Rails 2.3 (bpardee)
+ - Bug fixes
+
+
+0.9.3
+-----
+
+ - Rails 2.3 support (beanieboi)
+ - Rails SessionStore support
+ - Passenger integration
+ - memcache-client upgrade docs, see Upgrade.md
+
+
+0.9.2
+----
+
+ - Verify proper operation in Heroku.
+
+
+0.9.1
+----
+
+ - Add fetch and cas operations (mperham)
+ - Add incr and decr operations (mperham)
+ - Initial support for SASL authentication via the MEMCACHE_{USERNAME,PASSWORD} environment variables, needed for Heroku (mperham)
+
+0.9.0
+-----
+
+ - Initial gem release.
